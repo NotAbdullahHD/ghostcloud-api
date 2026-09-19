@@ -1,0 +1,42 @@
+# GhostCloud API — Cloudflare Workers
+# Deploy:  npx wrangler deploy      (from this folder)
+# Local:   npx wrangler dev --local  (http://localhost:8787)
+#
+# The whole API runs inside ONE Durable Object ("Hub"): it holds the account
+# pool, sessions, presence and the WebSocket relays, and uses alarms instead of
+# setInterval. That is what makes Pages-style free hosting unusable for this
+# app but Workers fine: the DO is the always-on process.
+
+name = "ghostcloud-api"
+main = "src/worker.js"
+compatibility_date = "2026-09-17"
+# Node timers (setTimeout) and friends. Enabled by default at this compat date,
+# but stated explicitly so changing the date can't silently break the app.
+compatibility_flags = ["nodejs_compat"]
+
+# The Durable Object namespace. `new_sqlite_classes` is REQUIRED on the free
+# plan — without it deploy fails with:
+#   "In order to use Durable Objects with a free plan, you must create a
+#    namespace using a `new_sqlite_classes` migration."
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Hub"]
+
+[[durable_objects.bindings]]
+name = "HUB"
+class_name = "Hub"
+
+[vars]
+# Pre-warmed accounts kept ready (3-20). Raise during school hours.
+GHOSTCLOUD_POOL_TARGET = "10"
+# Comma-separated mail.tm-shaped fallback providers (optional).
+GHOSTCLOUD_MAIL_PROVIDERS = "https://api.duckmail.sbs,https://api.mail.gw"
+
+# ── Secrets (set these, do NOT commit them) ─────────────────────────────────
+#   npx wrangler secret put GHOSTCLOUD_PRO_CODE      # the Pro code players type
+#   npx wrangler secret put GHOSTCLOUD_PRO_EPOCH     # bump to invalidate Pro tokens
+#   npx wrangler secret put GHOSTCLOUD_INBOUND_KEY   # own-domain mail lane secret
+#   npx wrangler secret put GHOSTCLOUD_MAIL_DOMAIN   # your domain -> enables the durable lane
+
+[observability]
+enabled = true
