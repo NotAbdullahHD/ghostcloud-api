@@ -150,6 +150,11 @@ const FREE_HOST_SUFFIXES = [
   "https://*.azurestaticapps.net",
   "https://*.gitlab.io", "https://*.codeberg.page", "https://*.surge.sh",
   "https://*.neocities.org", "https://*.tiiny.site", "https://*.js.org",
+  // Bunny CDN pull zones (ghostcloud-math.b-cdn.net and any future mirror).
+  // A CDN pull zone is free to create, so this is exactly as open as
+  // *.vercel.app / *.pages.dev above — replace it with the single exact
+  // origin if you'd rather keep the list tight and redeploy per mirror.
+  "https://*.b-cdn.net",
 ];
 
 export class Hub {
