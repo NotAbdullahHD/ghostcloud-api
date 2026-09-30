@@ -1,0 +1,12 @@
+# Dependencies (Workers Builds installs these itself)
+node_modules/
+
+# Local dev state (Durable Object SQLite, caches) — never commit
+.wrangler/
+.mf/
+.dev.vars
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.log
