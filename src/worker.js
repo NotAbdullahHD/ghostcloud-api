@@ -47,6 +47,13 @@ const QUEUE_ABANDON_MS = 60000;
 // The site pings every 45s; allow two missed pings before dropping a session so
 // one dropped request can't kill a game in progress.
 const PING_TIMEOUT_MS = 120000;
+// How long a live session survives without its signaling socket. That socket
+// only relays offers and ICE candidates — the video goes from the game server to
+// the player's browser directly — so a network blip must not cost somebody the
+// slot they queued for. Hold the session and let the client reattach to it.
+// Kept under PING_TIMEOUT_MS so a tab that really closed is reaped here, not by
+// the slower ping path. A client that is still pinging keeps refreshing it.
+const CLIENT_REATTACH_GRACE_MS = 90000;
 // Deadlines for states that never got their timers cleared.
 const REAPER_DEADLINES = { creating: 5 * 60 * 1000, finished_queue: 2 * 60 * 1000 };
 
@@ -739,6 +746,10 @@ export class Hub {
       if (s.state === "active") {
         if (s.ping_deadline && now > s.ping_deadline) { this.killSession(uuid, "ping_timeout"); continue; }
         if (s.session_deadline && now > s.session_deadline) { this.killSession(uuid, "max_session_length"); continue; }
+        // Signaling socket gone and nobody reattached in time — now it is over.
+        // A client that is still pinging refreshes detached_at (see
+        // handlePingSession), so only a genuinely absent client lands here.
+        if (s.detached_at && now - s.detached_at > CLIENT_REATTACH_GRACE_MS) { this.killSession(uuid, "client_ws_detached"); continue; }
         // Keep the Raccoon signaling socket warm (was a setInterval in Node).
         if (s.rSend && s.next_raccoon_ping_at && now >= s.next_raccoon_ping_at) {
           s.next_raccoon_ping_at = now + 30000;
@@ -753,6 +764,24 @@ export class Hub {
       if (s.state === "finished_queue" && s.startgame_deadline && now > s.startgame_deadline) { this.killSession(uuid, "startgame_timeout"); continue; }
       const deadline = REAPER_DEADLINES[s.state];
       if (deadline !== undefined && now - s.created_at > deadline) { this.killSession(uuid, `reaper:${s.state}_deadline`); continue; }
+    }
+
+    // The capacity line must not accumulate corpses. A waiter whose player
+    // closed the tab (or whose disconnect never reached us) would otherwise
+    // keep its index forever — inflating everybody else's position number, and
+    // later being started by drainCapacityQueue and stealing a real slot.
+    // Started waiters are out of the line already, so drop them from the array
+    // too: that is what keeps the advertised positions contiguous.
+    if (this.capacityWaiters.length) {
+      for (const w of this.capacityWaiters) {
+        if (!w.started && !w.ended && now - w.enqueuedAt > QUEUED_MAX_AGE) {
+          // Be honest instead of holding somebody for hours in a dead line.
+          w.push({ status: "error", error: "The line is too long right now — please try again later." });
+          try { w.controller.close(); } catch {}
+          w.ended = true;
+        }
+      }
+      this.capacityWaiters = this.capacityWaiters.filter((w) => !w.ended && !w.started);
     }
 
     // Keep the capacity line positions fresh.
@@ -1016,7 +1045,14 @@ export class Hub {
       ...(session.turns || []).map((t) => ({ urls: t.turn_url, username: t.turn_user, credential: t.turn_password })),
     ];
     const proto = ctx.url.protocol === "https:" ? "wss" : "ws";
-    const signalingWs = `${proto}://${ctx.url.host}/cloud/v1/signal/${uuid}`;
+    // The signaling socket is authenticated by this per-session token as well as
+    // the uuid, so a leaked uuid can't be used to hijack somebody's stream.
+    session.signal_token = generateSN();
+    session.detached_at = 0;
+    // reattaches is deliberately left undefined here: handleSignal counts the
+    // first attach as 0, so pre-seeding it would make every launch look like a
+    // reconnect.
+    const signalingWs = `${proto}://${ctx.url.host}/cloud/v1/signal/${uuid}?t=${session.signal_token}`;
     session.embed_ice_servers = iceServers;
     session.embed_signaling_ws = signalingWs;
     console.log(`startGame ${session.game_key} → ${uuid.slice(0, 8)}`);
@@ -1036,6 +1072,9 @@ export class Hub {
     if (session.last_ping_at && now - session.last_ping_at < 3000) return json({ error: "Ping every 3s max." }, 429);
     session.last_ping_at = now;
     session.ping_deadline = now + PING_TIMEOUT_MS;
+    // Still pinging without a signaling socket means the tab is alive and trying
+    // to reattach — keep its slot warm while it does.
+    if (session.detached_at) session.detached_at = now;
     const usage = this.getUsageStats(ctx.apiKey);
     const limits = this.getSiteLimits(ctx.site);
     return json({
@@ -1198,19 +1237,57 @@ export class Hub {
   }
 
   // ══ WebSocket signaling relay ══════════════════════════════════════════
+  // This socket carries offers and ICE candidates only — the media itself goes
+  // from the game server straight to the player. Losing it therefore does NOT
+  // mean the game is over: the session is held for CLIENT_REATTACH_GRACE_MS so
+  // the client can attach a new socket to the SAME session rather than lose its
+  // slot and re-queue behind everybody else.
   handleSignal(request, uuid) {
     if ((request.headers.get("upgrade") || "").toLowerCase() !== "websocket") return json({ error: "Expected WebSocket upgrade." }, 426);
     const session = this.sessions.get(uuid);
     if (!session || session.state !== "active") return json({ error: "Not active." }, 404);
+    const token = new URL(request.url).searchParams.get("t") || "";
+    if (session.signal_token && token !== session.signal_token) return json({ error: "Bad signaling token." }, 403);
     const [client, server] = Object.values(new WebSocketPair());
     server.accept();
+    // Attach first, then retire the old pipe: the superseded socket's close
+    // handler checks whether it is still the current one, so replacing it here
+    // is what stops a reattach from being killed by its own predecessor.
+    const previous = session.clientWs;
     session.clientWs = server;
+    session.detached_at = 0;
+    session.reattaches = typeof session.reattaches === "number" ? session.reattaches + 1 : 0;
+    if (previous && previous !== server) { try { previous.close(4000, "reattached"); } catch {} }
+    if (session.reattaches > 0) console.log(`session ${uuid.slice(0, 8)} signaling reattached (#${session.reattaches})`);
+    // The client's own countdown can be minutes off after a reconnect (a
+    // suspended tab, a long tunnel), so hand it the server's real numbers.
+    try {
+      server.send(JSON.stringify({
+        type: "signal_ready",
+        max_seconds: session.max_session_seconds,
+        remaining_seconds: Math.max(0, Math.round((session.session_deadline - Date.now()) / 1000)),
+        reattached: session.reattaches > 0,
+      }));
+      // If the launch already got this far, say so again — the original frame
+      // may have gone to the socket that just died.
+      if (session.game_ready_sent) server.send(JSON.stringify({ type: "game_ready" }));
+    } catch {}
     const self = this;
     server.addEventListener("message", (event) => {
       let msg;
       try { msg = JSON.parse(typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data)); } catch { return; }
       const rws = session.raccoonWs;
-      if (!rws || rws.readyState !== WS_OPEN) return;
+      if (!rws || rws.readyState !== WS_OPEN) {
+        // The relay to the game server is gone, so nothing the player sends can
+        // reach the game — and the client cannot see this at all (its own socket
+        // to us is still open). Log it: this is the silent failure that looks
+        // like "the stream just stopped" in the browser.
+        if (!session.rwsDownLogged) {
+          session.rwsDownLogged = true;
+          console.log(`session ${uuid.slice(0, 8)} cannot relay — raccoon socket is down`);
+        }
+        return;
+      }
       try {
         if (msg.type === "rtc_offer" && msg.sdp) {
           rws.send(JSON.stringify({ id: "rtc_sdp", from: session.sn, to: session.gl_key, body: { sdp: msg.sdp, type: "offer" } }));
@@ -1220,10 +1297,15 @@ export class Hub {
       } catch (e) { console.log(`client ws relay error: ${e.message}`); }
     });
     server.addEventListener("close", () => {
+      // A superseded socket closing is not the session ending.
+      if (session.clientWs !== server) return;
       session.clientWs = null;
-      // No signaling = no game. Drop the session promptly rather than waiting
-      // for the ping timeout.
-      if (self.sessions.get(uuid)) self.killSession(uuid, "client_ws_closed");
+      if (self.sessions.get(uuid) !== session) return;
+      // Hold the session open instead of killing it: the game is still running
+      // on the server and the player may be back in a second. The tick loop
+      // reaps it if nobody reattaches.
+      session.detached_at = Date.now();
+      console.log(`session ${uuid.slice(0, 8)} signaling detached — holding the slot for ${Math.round(CLIENT_REATTACH_GRACE_MS / 1000)}s`);
     });
     server.addEventListener("error", () => console.log("client ws error"));
     return new Response(null, { status: 101, webSocket: client });
@@ -1236,6 +1318,7 @@ export class Hub {
     const rSend = (p) => { try { if (raccoonWs.readyState === WS_OPEN) raccoonWs.send(JSON.stringify(p)); } catch {} };
     const toClient = (data) => { try { if (session.clientWs && session.clientWs.readyState === WS_OPEN) session.clientWs.send(JSON.stringify(data)); } catch {} };
     raccoonWs.addEventListener("open", () => {
+      session.rwsDownLogged = false;
       rSend({ id: "register", type: "webUA", uid: sn, token: decodeURIComponent(session.message_server.token) });
       // The 30s keep-alive ping is driven by the tick loop instead of
       // setInterval: a DO can be evicted and its timers silently vanish.
@@ -1256,7 +1339,12 @@ export class Hub {
           }
           break;
         case "start_game":
-          if (data.from === gl_key && data.body?.code === 200) toClient({ type: "game_ready" });
+          if (data.from === gl_key && data.body?.code === 200) {
+            // Remember it: if the player's socket dies before this arrives, a
+            // reattach can be handed the same news instead of waiting forever.
+            session.game_ready_sent = true;
+            toClient({ type: "game_ready" });
+          }
           break;
         case "rtc_sdp": {
           const b = data.body;
@@ -1267,9 +1355,11 @@ export class Hub {
         }
       }
     });
-    raccoonWs.addEventListener("close", () => {
+    raccoonWs.addEventListener("close", (event) => {
       session.rSend = null;
-      console.log(`raccoon ws closed for ${uuid.slice(0, 8)}`);
+      // If this fires while the session is active, the relay is dead and the
+      // player's picture is about to freeze for no reason they can see.
+      console.log(`raccoon ws closed for ${uuid.slice(0, 8)} code=${event && event.code} reason=${(event && event.reason) || ""} session_state=${session.state}`);
     });
     raccoonWs.addEventListener("error", () => console.log(`signal error on ${uuid.slice(0, 8)}`));
   }

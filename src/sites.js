@@ -9,7 +9,7 @@ export default {
       allowed_origins: [
         "http://localhost:4578",
         "http://localhost:8788",
-        "https://ghostcloud.ghostos.workers.dev",
+        "https://ghostcloud-app.ghostos.workers.dev",
       ],
       // Accept any well-known free static host (*.pages.dev, *.workers.dev,
       // *.github.io, *.vercel.app, *.netlify.app, …) so you can spin up a new
