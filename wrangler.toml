@@ -27,8 +27,11 @@ name = "HUB"
 class_name = "Hub"
 
 [vars]
-# Pre-warmed accounts kept ready (3-20). Raise during school hours.
-GHOSTCLOUD_POOL_TARGET = "10"
+# Pre-warmed accounts kept ready (3-20). Each pre-warmed account is a full
+# registration (mail provider + Raccoon), and keeping the pool topped up is what
+# drives the hub's Durable Object alarm loop — so a lower target directly
+# reduces daily request burn. Raise it during school hours if signups drag.
+GHOSTCLOUD_POOL_TARGET = "3"
 # Comma-separated mail.tm-shaped fallback providers (optional).
 GHOSTCLOUD_MAIL_PROVIDERS = "https://api.duckmail.sbs,https://api.mail.gw"
 

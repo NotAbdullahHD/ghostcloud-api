@@ -29,9 +29,20 @@ const MAX_SESSION_SECONDS = 19 * 60;
 const DEFAULT_SESSION_SECONDS = 19 * 60;
 const WS_OPEN = 1;
 
-const TICK_MS = 3000;                    // maintenance tick while work exists
+// How often the maintenance tick runs while there is work (live sessions or a
+// non-empty waiting line). Every alarm invocation is a billed Durable Object
+// request, and 3s ticks alone were ~29k/day against the free plan's 100k/day —
+// nothing in tick() needs better than ~30s granularity anyway (Raccoon
+// keep-alive ping 30s, cost tick 25s, ping deadline 120s), so 10s is ample.
+const TICK_MS = 10000;                   // maintenance tick while work exists
 const COST_INTERVAL_MS = 25000;
 const POOL_FILL_INTERVAL_MS = 20000;
+// The pool-fill path must never busy-loop. `nextPoolFillAt` can legitimately be
+// in the past — a slow fill outlives its own interval, and a fill already in
+// flight blocks the next one — so the old `Math.max(1000, …)` below re-armed
+// the alarm once a second. That is up to ~86k billed DO requests a day on an
+// idle hub, against a 100k/day budget. This floor is the fix.
+const POOL_FILL_MIN_DELAY_MS = 20000;
 const POOL_FILL_STARTUP_GRACE_MS = 3000;
 const DASHBOARD_INTERVAL_MS = 5 * 60 * 1000;
 // Presence TTL is deliberately generous (5 min) because the site now only
@@ -171,7 +182,7 @@ export class Hub {
     this.storage = state.storage;
 
     this.sites = SITES;
-    this.POOL_TARGET = Math.min(Math.max(parseInt(env.GHOSTCLOUD_POOL_TARGET || "10", 10) || 10, 3), 20);
+    this.POOL_TARGET = Math.min(Math.max(parseInt(env.GHOSTCLOUD_POOL_TARGET || "3", 10) || 3, 3), 20);
     this.MAIL_PROVIDERS = (env.GHOSTCLOUD_MAIL_PROVIDERS || "https://api.duckmail.sbs,https://api.mail.gw")
       .split(",").map((s) => s.trim()).filter(Boolean);
     this.MAIL_DOMAIN = (env.GHOSTCLOUD_MAIL_DOMAIN || "").trim().toLowerCase();
@@ -710,7 +721,7 @@ export class Hub {
   nextTickDelay() {
     if (this.sessions.size > 0) return TICK_MS;
     if (this.capacityWaiters.some((w) => !w.ended)) return TICK_MS;
-    if (this.pool.length < this.POOL_TARGET) return Math.max(1000, this.nextPoolFillAt - Date.now());
+    if (this.pool.length < this.POOL_TARGET) return Math.max(POOL_FILL_MIN_DELAY_MS, this.nextPoolFillAt - Date.now());
     return 0;
   }
   ensureTicking() {
@@ -816,9 +827,13 @@ export class Hub {
     // is refused the attempts back off exponentially, so a broken setup can't
     // burn the free plan's daily request budget on idle ticks.
     if (this.pool.length < this.POOL_TARGET && !this.poolFilling && now >= this.nextPoolFillAt) {
-      const backoff = Math.min(POOL_FILL_INTERVAL_MS * Math.pow(2, Math.min(this.poolFillFails, 5)), 5 * 60 * 1000);
-      this.nextPoolFillAt = now + backoff;
       await this.fillPoolOnce();
+      // Arm the next attempt *after* the fill, never before it. Setting the
+      // deadline up front meant a fill slower than POOL_FILL_INTERVAL_MS left
+      // `nextPoolFillAt` in the past the moment it returned, so the alarm fired
+      // again immediately and re-filled on a tight loop.
+      const backoff = Math.min(POOL_FILL_INTERVAL_MS * Math.pow(2, Math.min(this.poolFillFails, 5)), 5 * 60 * 1000);
+      this.nextPoolFillAt = Date.now() + backoff;
     }
 
     if (now - this.lastDashboardAt > DASHBOARD_INTERVAL_MS) {
