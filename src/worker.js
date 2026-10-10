@@ -44,6 +44,29 @@ const POOL_FILL_INTERVAL_MS = 20000;
 // idle hub, against a 100k/day budget. This floor is the fix.
 const POOL_FILL_MIN_DELAY_MS = 20000;
 const POOL_FILL_STARTUP_GRACE_MS = 3000;
+// Ceiling on the pool-fill backoff. It used to climb to 5 minutes, which meant
+// the pool gave up refilling at exactly the moment it was needed most: the
+// busiest hour is when fills fail, the backoff then parks the pool for five
+// minutes, every player past the last pooled account falls through to a live
+// registration, and those registrations are what the mail providers rate-limit.
+// A minute is long enough to stop a broken lane from spinning.
+const POOL_FILL_MAX_BACKOFF_MS = 60000;
+// How many account registrations may be in flight at once, across every site.
+// Free temp-mail providers rate-limit per provider, not per site, so this is a
+// process-wide cap. The old value was `max_concurrent_sessions * 2` = 30, i.e.
+// up to 30 simultaneous registrations against api.tempmail.lol / mail.gw the
+// moment the pool ran dry — a guaranteed HTTP 429 storm and the exact error
+// players were seeing. Registrations are slow (30-60s each), so the players
+// beyond this limit now wait in the visible line instead of failing.
+const ACCOUNT_CREATE_MAX = 2;
+// How long a player may wait for one of those registration slots before we give
+// up. The client drops a setup stream that goes quiet for 90s, so the wait loop
+// below emits a progress event well inside that window.
+const ACCOUNT_SLOT_WAIT_MS = 150000;
+// Session endings that mean the *account* is finished too, so it must not go back
+// into the pool. "upstream_terminated" is Raccoon's own status 3013 (it killed
+// the account); "creation_error" never produced a working one.
+const ACCOUNT_DEAD_REASONS = new Set(["upstream_terminated", "creation_error", "account_unusable"]);
 const DASHBOARD_INTERVAL_MS = 5 * 60 * 1000;
 // Presence TTL is deliberately generous (5 min) because the site now only
 // heartbeats every 2 min and skips hidden tabs — Cloudflare's free plan allows
@@ -99,13 +122,41 @@ function preflight(origin) {
 // produced (empty bodies under load were the old "Unexpected end of JSON input").
 async function parseJsonResponse(res, what) {
   if (!res.ok) {
-    if (res.status >= 500) throw new Error(`${what} is briefly unavailable right now (HTTP ${res.status}) — try again in a moment.`);
-    throw new Error(`${what} is at capacity right now (HTTP ${res.status}) — please try again in a moment.`);
+    const err = new Error(res.status >= 500
+      ? `${what} is briefly unavailable right now (HTTP ${res.status}) — try again in a moment.`
+      : `${what} is at capacity right now (HTTP ${res.status}) — please try again in a moment.`);
+    // Carried on the error so createAccountRaw can honour a provider's own
+    // cooldown instead of guessing, and so callers can tell "this lane is
+    // throttled" (retry later, try another lane) from "this lane is broken".
+    err.httpStatus = res.status;
+    err.throttled = res.status === 429 || res.status === 402 || res.status === 403;
+    const ra = parseInt(res.headers.get("retry-after") || "", 10);
+    if (Number.isFinite(ra) && ra > 0) err.retryAfterMs = Math.min(ra * 1000, 30000);
+    throw err;
   }
   const t = await res.text();
   if (!t) throw new Error(`${what} is under heavy load right now and sent no response — try again in a moment.`);
   try { return JSON.parse(t); }
   catch { throw new Error(`${what} sent an invalid response — try again in a moment.`); }
+}
+// Mail-lane ids, provider hostnames and HTTP codes belong in the logs, not on a
+// player's screen: they read as "something is broken" and are what turns one
+// transient throttle into a wall of support questions. Anything that came out of
+// a provider is replaced with one calm, accurate sentence; errors we wrote for
+// the player ourselves (the play-credits message, a refused registration) pass
+// through untouched.
+// The one player-facing sentence for every "the machinery behind this is busy"
+// case: rate limits, dead mail lanes, an exhausted queue. Deliberately without a
+// provider name, an HTTP code, or a "why" — all of that is accurate and none of
+// it is the player's problem.
+const BUSY_MESSAGE = "We're at our busiest right now and couldn't set up your game in time — please try again in a moment. Nothing is wrong on your side.";
+function playerMessage(e) {
+  if (e && e.busy) return BUSY_MESSAGE;
+  const m = String((e && e.message) || "");
+  if (/at capacity|rate limit|heavy load|briefly unavailable|invalid response|no response|no verification code|No mail domains|blocklisted by Raccoon|Raccoon refused/i.test(m)) {
+    return BUSY_MESSAGE;
+  }
+  return m;
 }
 function fetchWithTimeout(url, opts = {}, ms = RACCOON_TIMEOUT_MS) {
   return fetch(url, { ...opts, signal: AbortSignal.timeout(ms) });
@@ -182,7 +233,10 @@ export class Hub {
     this.storage = state.storage;
 
     this.sites = SITES;
-    this.POOL_TARGET = Math.min(Math.max(parseInt(env.GHOSTCLOUD_POOL_TARGET || "3", 10) || 3, 3), 20);
+    this.POOL_TARGET = Math.min(Math.max(parseInt(env.GHOSTCLOUD_POOL_TARGET || "6", 10) || 6, 3), 20);
+    // Hand a finished session's account back to the pool instead of discarding
+    // it, so the next player reuses it. See recycleAccount().
+    this.ACCOUNT_REUSE = env.GHOSTCLOUD_REUSE_ACCOUNTS !== "off";
     this.MAIL_PROVIDERS = (env.GHOSTCLOUD_MAIL_PROVIDERS || "https://api.duckmail.sbs,https://api.mail.gw")
       .split(",").map((s) => s.trim()).filter(Boolean);
     this.MAIL_DOMAIN = (env.GHOSTCLOUD_MAIL_DOMAIN || "").trim().toLowerCase();
@@ -199,7 +253,8 @@ export class Hub {
     this.siteUsage = new Map();
     this.ipLimits = new Map();
     this.embedIpLimits = new Map();
-    this.accountCreating = new Map();
+    this.accountCreators = 0; // registrations in flight (global — see ACCOUNT_CREATE_MAX)
+    this.accountWaiters = []; // players queued for a registration slot, oldest first
     this.capacityWaiters = [];
     this.proTokens = new Map();
     this.proAttempts = new Map();
@@ -354,22 +409,72 @@ export class Hub {
     for (const s of this.sessions.values()) if (s.api_key === apiKey) n++;
     return n;
   }
-  acquireAccountSlot(apiKey, site) {
-    const cap = (site.max_concurrent_sessions ?? 5) * 2;
-    const current = this.accountCreating.get(apiKey) ?? 0;
-    if (current >= cap) return false;
-    this.accountCreating.set(apiKey, current + 1);
+  // Take a registration slot, or return false if they are all busy. The cap is
+  // global (ACCOUNT_CREATE_MAX) rather than per site because the thing being
+  // protected — a free temp-mail provider — does not know or care which site a
+  // request came from.
+  acquireAccountSlot() {
+    if (this.accountCreators >= ACCOUNT_CREATE_MAX) return false;
+    this.accountCreators += 1;
     return true;
   }
-  releaseAccountSlot(apiKey) {
-    const current = this.accountCreating.get(apiKey) ?? 1;
-    const next = current - 1;
-    if (next <= 0) this.accountCreating.delete(apiKey);
-    else this.accountCreating.set(apiKey, next);
+  releaseAccountSlot() {
+    this.accountCreators = Math.max(0, this.accountCreators - 1);
+  }
+  // Waits for a registration slot, keeping the player's setup stream alive with
+  // progress events while they wait. This is the difference between "you are in
+  // line, hang on" and the raw provider error that used to end the attempt: the
+  // wait is bounded, cancellable, and visible, so a busy moment costs a short
+  // wait instead of a failed click.
+  async waitForAccountSlot(w) {
+    if (this.acquireAccountSlot()) { w.slotHeld = true; return true; }
+    this.accountWaiters.push(w);
+    const deadline = Date.now() + ACCOUNT_SLOT_WAIT_MS;
+    let lastNoticeAt = 0;
+    try {
+      while (Date.now() < deadline) {
+        if (w.ended) return false; // player closed the tab — stop waiting
+        // Reuse the client's existing queue rendering: it already turns these
+        // into "you're #N in line, your game starts automatically", which is both
+        // honest and the exact opposite of the provider error this replaces.
+        if (Date.now() - lastNoticeAt > 5000) {
+          lastNoticeAt = Date.now();
+          const idx = this.accountWaiters.indexOf(w);
+          w.push({
+            status: "capacity_queue",
+            position: idx >= 0 ? idx + 1 : 1,
+            waited_seconds: Math.round((Date.now() - w.enqueuedAt) / 1000),
+            reason: "account_setup",
+          });
+        }
+        await sleep(2000);
+        if (w.ended) return false;
+        if (this.acquireAccountSlot()) { w.slotHeld = true; return true; }
+      }
+      return false;
+    } finally {
+      const idx = this.accountWaiters.indexOf(w);
+      if (idx >= 0) this.accountWaiters.splice(idx, 1);
+    }
+  }
+  // Release once and only once, whatever path the setup took. Without the flag a
+  // failure after a successful registration would decrement again and quietly
+  // widen the cap this whole mechanism exists to enforce.
+  releaseAccountSlotFor(w) {
+    if (!w.slotHeld) return;
+    w.slotHeld = false;
+    this.releaseAccountSlot();
   }
 
   // ══ Mail lanes ══════════════════════════════════════════════════════════
   isTempBlockedMessage(msg) { return /temporary email|not supported|disposable/i.test(String(msg || "")); }
+  // Raccoon's anti-bot wall. Unlike "this domain is a disposable mailbox", this
+  // is not about the address: it refuses every address, including a real one, so
+  // rotating domains or retrying the same lane cannot get past it. Walking the
+  // remaining lanes, passes and providers after this is pure waste — it burns
+  // subrequests, spends provider quota, and delays the player's error by ~45s
+  // for an answer that will not change. Recognise it and stop.
+  isRaccoonWall(msg) { return /puzzle|captcha|human|robot|slide|too frequent/i.test(String(msg || "")); }
   markDomainBlocked(email, why) {
     const dom = String(email || "").split("@")[1];
     if (!dom || !this.isTempBlockedMessage(why) || this.blockedMailDomains.has(dom)) return;
@@ -453,10 +558,13 @@ export class Hub {
         if (!domains.length) throw new Error(self.blockedMailDomains.size ? "all of its domains are blocklisted by Raccoon" : "No mail domains available");
         const email = `rcn_${Math.random().toString(36).substring(2, 11)}@${domains[0]}`;
         const mailPassword = generatePassword();
-        await fetchWithTimeout(`${base}/accounts`, {
+        // Checked, not fire-and-forget: an unchecked failure here surfaces later
+        // as a confusing 401 from /token, which reads as "wrong password" when
+        // the mailbox was simply never created.
+        await parseJsonResponse(await fetchWithTimeout(`${base}/accounts`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ address: email, password: mailPassword }),
-        });
+        }), "Account service");
         const { token: mailJwt } = await parseJsonResponse(await fetchWithTimeout(`${base}/token`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ address: email, password: mailPassword }),
@@ -496,7 +604,9 @@ export class Hub {
       return `${l.id} ok=${st?.ok ?? 0} fail=${st?.fail ?? 0}${skipped}`;
     });
     const blocked = this.blockedMailDomains.size ? ` | raccoon-blocked domains: ${[...this.blockedMailDomains].join(",")}` : "";
-    return `providers: ${parts.join(" | ")} | pool ${this.pool.length}/${this.POOL_TARGET}${blocked}`;
+    const fresh = this.pool.filter((a) => !(a.plays || 0)).length;
+    const reuse = this.ACCOUNT_REUSE ? ` (${fresh} fresh, ${this.pool.length - fresh} reused)` : " (reuse off)";
+    return `providers: ${parts.join(" | ")} | pool ${this.pool.length}/${this.POOL_TARGET}${reuse}${blocked}`;
   }
   async pollCode(lane, handle, maxRetries = 17) {
     for (let i = 0; i < maxRetries; i++) {
@@ -523,9 +633,15 @@ export class Hub {
   }
   async createAccountRaw() {
     const passBackoffMs = [3000, 8000, 20000];
+    // A lane that just answered 429 is not going to answer differently two
+    // seconds later, and every retry against it is another request on a meter
+    // that is already full. Sit it out for the rest of this attempt.
+    const throttledLanes = new Set();
     let lastErr = null;
+    let hardStop = null; // a wall we cannot wait out — abort the whole attempt
     for (let pass = 0; pass <= passBackoffMs.length; pass++) {
       for (const lane of this.laneOrder()) {
+        if (throttledLanes.has(lane.id)) continue;
         try {
           const { email, handle } = await lane.create();
           if (this.blockedMailDomains.has(String(email).split("@")[1])) continue;
@@ -545,18 +661,34 @@ export class Hub {
             code = await this.pollCode(lane, handle, 17);
           }
           if (rejected) {
+            if (this.isRaccoonWall(rejected)) {
+              hardStop = Object.assign(new Error(`Raccoon is gating registration behind a bot check: ${rejected}`), { busy: true, raccoonWall: true });
+              console.log(`raccoon wall: "${rejected}" — aborting account creation (no domain or lane change will pass this)`);
+              break;
+            }
             this.markDomainBlocked(email, rejected);
             this.noteProviderFail(lane.id, new Error(rejected));
             lastErr = new Error(`Raccoon refused ${email.split("@")[1]}: ${rejected}`);
+            console.log(`lane ${lane.id} failed (pass ${pass + 1}): ${lastErr.message}`);
             continue;
           }
-          if (!code) { lastErr = new Error(`no verification code from ${lane.id}`); this.noteProviderFail(lane.id, lastErr); continue; }
+          if (!code) {
+            lastErr = new Error(`no verification code from ${lane.id}`);
+            this.noteProviderFail(lane.id, lastErr);
+            console.log(`lane ${lane.id} failed (pass ${pass + 1}): ${lastErr.message}`);
+            continue;
+          }
           const regRes = await this.raccoonFetch("/users/emailRegister", {
             method: "POST", headers: h,
             body: new URLSearchParams({ email, code, password: raccoonPassword, phone: "1", country: "Brazil", ...common }),
           });
           const regRejected = this.raccoonRejectedMail(await regRes.json().catch(() => null));
           if (regRejected) {
+            if (this.isRaccoonWall(regRejected)) {
+              hardStop = Object.assign(new Error(`Raccoon is gating registration behind a bot check: ${regRejected}`), { busy: true, raccoonWall: true });
+              console.log(`raccoon wall at registration: "${regRejected}" — aborting account creation`);
+              break;
+            }
             this.markDomainBlocked(email, regRejected);
             throw new Error(`register refused: ${regRejected}`);
           }
@@ -573,28 +705,70 @@ export class Hub {
           this.noteProviderOk(lane.id);
           return { sn, token: userToken };
         } catch (e) {
+          if (this.isRaccoonWall(e.message)) { hardStop = Object.assign(e, { busy: true, raccoonWall: true }); break; }
           lastErr = e;
+          if (e && e.throttled) throttledLanes.add(lane.id);
+          // Logged per lane, as it happens. The old code only logged `lastErr`
+          // after the whole pass, which is whatever lane happened to be *last* in
+          // the order — so three unrelated failures all got reported as the same
+          // one, and the lane that was actually broken stayed invisible.
+          console.log(`lane ${lane.id} failed (pass ${pass + 1}): ${e.message}`);
           this.noteProviderFail(lane.id, e);
         }
       }
+
+      if (hardStop) break; // a wall, not congestion — backoff would only delay it
       if (pass < passBackoffMs.length) {
-        console.log(`account creation failed (${lastErr ? lastErr.message : "every mail lane is blocklisted"}) — retrying in ${passBackoffMs[pass] / 1000}s`);
-        await sleep(passBackoffMs[pass]);
+        // Honour the provider's own cooldown when it sent one — guessing short
+        // is what turns one throttle into three.
+        const wait = Math.max(passBackoffMs[pass], lastErr?.retryAfterMs || 0);
+        console.log(`account creation failed (${lastErr ? lastErr.message : "every mail lane is blocklisted"}) — retrying in ${Math.round(wait / 1000)}s`);
+        await sleep(wait);
       }
     }
+    if (hardStop) throw hardStop;
     throw lastErr || new Error("Account creation failed on all providers");
   }
+  // Fresh accounts first, then the least-used. Preferring `plays === 0` matters
+  // because a never-played account is the one most likely to still have its
+  // signup play credits; preferring the lowest count after that spreads reuse
+  // across the whole pool rather than hammering a single account.
+  takePooledAccount() {
+    if (!this.pool.length) return null;
+    let best = 0;
+    for (let i = 1; i < this.pool.length; i++) {
+      if ((this.pool[i].plays || 0) < (this.pool[best].plays || 0)) best = i;
+    }
+    return this.pool.splice(best, 1)[0];
+  }
   async createAccount() {
-    if (this.pool.length > 0) {
-      const acc = this.pool.shift();
-      console.log(`pool: served (${this.pool.length} left)`);
+    const acc = this.takePooledAccount();
+    if (acc) {
+      console.log(`pool: served (${acc.plays ? `reused x${acc.plays}` : "fresh"}) — ${this.pool.length} left`);
       this.state.waitUntil(this.savePool());
       this.ensureTicking();
       return acc;
     }
-    const acc = await this.createAccountRaw();
+    const created = await this.createAccountRaw();
     this.ensureTicking();
-    return acc;
+    return created;
+  }
+  // Put a finished session's account back in the pool. This is the difference
+  // between one registration per session and one per handful: Raccoon gates
+  // registration behind a bot check, so the fewer registrations the better — and
+  // a real player registers once and then plays many games on that account.
+  recycleAccount(session, reason) {
+    if (!this.ACCOUNT_REUSE) return;
+    if (!session || !session.sn || !session.token) return;
+    if (session.account_dead) return; // the account itself failed, not the session
+    if (session.account_recyclable === false) return; // the player's own account
+    if (ACCOUNT_DEAD_REASONS.has(reason)) return;
+    // A session that never got past setup holds an account that was never used.
+    if (session.state === "creating") return;
+    const plays = (session.account_plays || 0) + 1;
+    this.pool.push({ sn: session.sn, token: session.token, plays });
+    console.log(`pool: recycled account (${plays} play${plays === 1 ? "" : "s"}, ${reason}) — ${this.pool.length} ready`);
+    this.state.waitUntil(this.savePool());
   }
   async savePool() {
     try { await this.storage.put("pool", this.pool); } catch {}
@@ -707,6 +881,7 @@ export class Hub {
     this.state.waitUntil(this.doStopGame(session).catch(() => {}));
     this.sessions.delete(uuid);
     console.log(`session ${uuid.slice(0, 8)} killed — ${reason}`);
+    this.recycleAccount(session, reason);
     this.drainCapacityQueue();
     this.ensureTicking();
   }
@@ -832,7 +1007,7 @@ export class Hub {
       // deadline up front meant a fill slower than POOL_FILL_INTERVAL_MS left
       // `nextPoolFillAt` in the past the moment it returned, so the alarm fired
       // again immediately and re-filled on a tight loop.
-      const backoff = Math.min(POOL_FILL_INTERVAL_MS * Math.pow(2, Math.min(this.poolFillFails, 5)), 5 * 60 * 1000);
+      const backoff = Math.min(POOL_FILL_INTERVAL_MS * Math.pow(2, Math.min(this.poolFillFails, 5)), POOL_FILL_MAX_BACKOFF_MS);
       this.nextPoolFillAt = Date.now() + backoff;
     }
 
@@ -860,7 +1035,8 @@ export class Hub {
       w.queued = false;
       w.push({ status: "slot_reserved" });
       this.runCreateSessionFlow(w).catch((e) => {
-        w.push({ status: "error", error: e.message });
+        console.log(`setup failed for ${String(w.sessionUuid || "?").slice(0, 8)} — ${e.message}`);
+        w.push({ status: "error", error: playerMessage(e) });
         try { w.controller.close(); } catch {}
       });
     }
@@ -884,7 +1060,8 @@ export class Hub {
       this.broadcastCapacityQueue();
     } else {
       this.runCreateSessionFlow(waiter).catch((e) => {
-        waiter.push({ status: "error", error: e.message });
+        console.log(`setup failed for ${String(waiter.sessionUuid || "?").slice(0, 8)} — ${e.message}`);
+        waiter.push({ status: "error", error: playerMessage(e) });
         try { waiter.controller.close(); } catch {}
       });
     }
@@ -900,6 +1077,7 @@ export class Hub {
     const waiter = {
       apiKey, site, game_key, manualAccount, queued,
       enqueuedAt: Date.now(), ended: false, started: !queued,
+      slotHeld: false, // true while this player holds one of ACCOUNT_CREATE_MAX slots
       controller: null, sessionUuid: null, response: null,
       push(obj) {
         if (this.ended || !this.controller) return;
@@ -935,9 +1113,9 @@ export class Hub {
     const { apiKey, site, game_key, manualAccount } = w;
     const startedAt = Date.now();
     const rl = this.checkRateLimit(apiKey, site);
-    if (!rl.allowed) { w.push({ status: "error", error: `Rate limit: ${rl.reason}` }); try { w.controller.close(); } catch {} return; }
-    if (!manualAccount && !this.acquireAccountSlot(apiKey, site)) {
-      w.push({ status: "error", error: "Too many sessions being created." });
+    if (!rl.allowed) {
+      console.log(`rate limited ${String(apiKey).slice(-6)} — ${rl.reason}`);
+      w.push({ status: "error", error: BUSY_MESSAGE });
       try { w.controller.close(); } catch {}
       return;
     }
@@ -957,17 +1135,40 @@ export class Hub {
     this.ensureTicking();
     try {
       let acc;
+      // Bind an account to this session, remembering where it came from. The play
+      // count travels back into the pool on recycle, an account that has no play
+      // credits must not be handed to the next player, and one a player supplied
+      // themselves must never be pooled for somebody else to use.
+      const bindAccount = (a, { dead = false, recyclable = true } = {}) => {
+        acc = a;
+        session.sn = a.sn; session.token = a.token;
+        session.account_plays = a.plays || 0;
+        session.account_dead = dead;
+        session.account_recyclable = recyclable;
+      };
       if (manualAccount) {
-        acc = manualAccount;
+        bindAccount(manualAccount, { recyclable: false });
         w.push({ status: "account_ready" });
       } else {
+        // Registration slots are capped globally, so a rush means waiting a
+        // short while here rather than every player racing to register at once
+        // and all of them being throttled. The session already exists (so it
+        // still counts against max_concurrent_sessions) and waitForAccountSlot
+        // keeps the stream alive with queue events, so the client's idle timer
+        // never trips and the player sees a line instead of an error.
+        // `creating_account` is only sent once a slot is actually held: while
+        // waiting, the player is told they are in line, which is the truth.
+        if (!(await this.waitForAccountSlot(w))) {
+          if (w.ended) return;
+          throw Object.assign(new Error("no registration slot free in time"), { busy: true });
+        }
         w.push({ status: "creating_account" });
-        acc = await this.createAccount();
-        this.releaseAccountSlot(apiKey);
-        if (!this.sessions.has(uuid) || w.ended) return;
+        const fresh = await this.createAccount();
+        bindAccount(fresh);
+        if (!this.sessions.has(uuid) || w.ended) { this.releaseAccountSlotFor(w); return; }
         w.push({ status: "account_ready" });
       }
-      session.sn = acc.sn; session.token = acc.token;
+      if (!acc) return;
       this.recordUsage(apiKey);
       w.push({ status: "requesting_game" });
       let init = null;
@@ -979,8 +1180,11 @@ export class Hub {
             creditRetries++;
             console.log(`no credits on ${uuid.slice(0, 8)} — trying another account (${creditRetries})`);
             w.push({ status: "creating_account" });
-            acc = await this.createAccount();
-            session.sn = acc.sn; session.token = acc.token;
+            // The account we are dropping is marked dead rather than recycled:
+            // it cannot play the requested game, so handing it to the next player
+            // would just move the same failure one seat along.
+            session.account_dead = true;
+            bindAccount(await this.createAccount());
             w.push({ status: "account_ready" });
             w.push({ status: "requesting_game" });
             continue;
@@ -988,6 +1192,9 @@ export class Hub {
           throw e;
         }
       }
+      // Registration is done — including any play-credits retry above, which
+      // registers another account and needs the same protection.
+      this.releaseAccountSlotFor(w);
       if (!this.sessions.has(uuid) || w.ended) return;
       if (init.queued) {
         session.state = "queued";
@@ -1003,8 +1210,9 @@ export class Hub {
       }
       if (Date.now() - startedAt > SETUP_DEADLINE_MS) console.log(`setup for ${uuid.slice(0, 8)} took over 5 min`);
     } catch (e) {
-      if (!manualAccount) this.releaseAccountSlot(apiKey);
-      w.push({ status: "error", error: e.message });
+      this.releaseAccountSlotFor(w);
+      console.log(`creation failed for ${uuid.slice(0, 8)} — ${e.message}`);
+      w.push({ status: "error", error: playerMessage(e) });
       this.killSession(uuid, "creation_error");
     } finally {
       try { w.controller.close(); } catch {}
@@ -1231,7 +1439,31 @@ export class Hub {
 
   // ══ Diagnostics ═════════════════════════════════════════════════════════
   async handleDiagMail(ctx) {
-    const out = { lanes: this.allLanes().map((l) => l.id), ownDomain: this.MAIL_DOMAIN || "(not configured)", pool: `${this.pool.length}/${this.POOL_TARGET}`, blockedDomains: [...this.blockedMailDomains] };
+    const out = {
+      lanes: this.allLanes().map((l) => l.id),
+      ownDomain: this.MAIL_DOMAIN || "(not configured)",
+      pool: `${this.pool.length}/${this.POOL_TARGET}`,
+      // How much of the fleet is recycled. A pool that is mostly `reused` is the
+      // sign that registration volume has dropped away as intended.
+      reuse: {
+        enabled: this.ACCOUNT_REUSE,
+        ready: this.pool.length,
+        fresh: this.pool.filter((a) => !(a.plays || 0)).length,
+        reused: this.pool.filter((a) => (a.plays || 0) > 0).length,
+        totalPlays: this.pool.reduce((n, a) => n + (a.plays || 0), 0),
+      },
+      blockedDomains: [...this.blockedMailDomains],
+      // Last error per lane. Without this the only way to find out which lane is
+      // wedged — and why — was a live `wrangler tail`.
+      laneStats: Object.fromEntries(this.allLanes().map((l) => {
+        const st = this.providerStats.get(l.id) || { ok: 0, fail: 0, lastErr: null };
+        const h = this.providerHealth.get(l.id) || {};
+        return [l.id, {
+          ok: st.ok, fail: st.fail, lastErr: st.lastErr,
+          skippedUntil: h.skipUntil > Date.now() ? new Date(h.skipUntil).toISOString() : null,
+        }];
+      })),
+    };
     for (const base of this.MAIL_PROVIDERS) {
       const t0 = Date.now();
       try {
@@ -1240,6 +1472,28 @@ export class Hub {
         out[base] = { status: r.status, ms: Date.now() - t0, body_len: t.length, body_head: t.slice(0, 120) };
       } catch (e) { out[base] = { error: e.message }; }
     }
+    // Can an account be created at all right now? `sendEmail` is the first
+    // Raccoon call registration makes. The address is deliberately a reserved
+    // one (@example.com), so no mail is delivered anywhere — this only asks
+    // Raccoon whether it is willing to talk to us.
+    const t0 = Date.now();
+    try {
+      const r = await this.raccoonFetch("/users/sendEmail", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" },
+        body: new URLSearchParams({
+          email: `rcn_health_${Math.random().toString(36).slice(2, 9)}@example.com`,
+          type: "register", sn: generateSN(), model: "Chrome/147.0.0.0", version_code: "1",
+          version_name: "1.0.0", device_name: "GhostCloud", os: "web",
+        }),
+      });
+      const d = await r.json().catch(() => null);
+      out.raccoon = {
+        http: r.status, ms: Date.now() - t0,
+        reply: (d && (d.msg || d.status)) || "(empty body)",
+        walled: this.isRaccoonWall(d && d.msg),
+      };
+    } catch (e) { out.raccoon = { error: e.message, ms: Date.now() - t0 }; }
     return json(out);
   }
   handleEmbedData(ctx) {
