@@ -27,11 +27,20 @@ name = "HUB"
 class_name = "Hub"
 
 [vars]
-# Pre-warmed accounts kept ready (3-20). Each pre-warmed account is a full
-# registration (mail provider + Raccoon), and keeping the pool topped up is what
-# drives the hub's Durable Object alarm loop — so a lower target directly
-# reduces daily request burn. Raise it during school hours if signups drag.
-GHOSTCLOUD_POOL_TARGET = "3"
+# Pre-warmed accounts kept ready (3-20). A pooled account is an instant start;
+# nobody past the end of the pool gets one, and those players are the ones that
+# hammer the free mail providers into HTTP 429.
+#
+# Back up from 3: the daily Durable Object burn is set by the *alarm floor*
+# (POOL_FILL_MIN_DELAY_MS = 20s), not by the target size — a full pool costs
+# nothing at idle, and a draining one is capped at one fill attempt per 20s.
+# Queue pressure, on the other hand, scales directly with how small this is.
+GHOSTCLOUD_POOL_TARGET = "6"
+# Reuse a finished session's account for the next player instead of registering a
+# brand-new one for every session (which is what got Raccoon's registration
+# endpoint gated behind a bot check). Set to "off" to go back to one account per
+# session. Fresh accounts are used first; the least-used one after that.
+GHOSTCLOUD_REUSE_ACCOUNTS = "on"
 # Comma-separated mail.tm-shaped fallback providers (optional).
 GHOSTCLOUD_MAIL_PROVIDERS = "https://api.duckmail.sbs,https://api.mail.gw"
 
