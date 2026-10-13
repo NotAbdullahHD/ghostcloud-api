@@ -76,11 +76,24 @@ env.HUB (Hub)   Durable Object
 | `GHOSTCLOUD_PRO_EPOCH` | e.g. `1` | bump to invalidate every issued Pro token |
 | `GHOSTCLOUD_INBOUND_KEY` | any random string | only if you later use the own-domain mail lane |
 | `GHOSTCLOUD_MAIL_DOMAIN` | e.g. `mail.yourdomain.com` | only if you set that lane up |
+| `GHOSTCLOUD_SEED_KEY` | any random string | recommended: without it, anyone holding the site's API key can call `/cloud/v1/seedPool` |
 
-`GHOSTCLOUD_POOL_TARGET` (pre-warmed accounts, 3–20) is set to `3` in
+`GHOSTCLOUD_POOL_TARGET` (pre-warmed accounts, 3–20) is set to `6` in
 `wrangler.toml`; override it here if you want a different size. Each pre-warmed
-account is a full registration, and topping the pool up is what drives the
-alarm loop — a bigger pool costs more of the daily request budget.
+account is a full registration, but the daily burn is set by the alarm *floor*
+(`POOL_FILL_MIN_DELAY_MS`, 20s), not by the target — a full pool costs nothing at
+idle.
+
+`GHOSTCLOUD_WALL_COOLDOWN_MS` (default `600000`, i.e. 10 min) is how long the
+worker stops attempting registrations after Raccoon's bot check is seen. See
+[the bot-check section](#please-complete-the-puzzle-verification--raccoons-bot-check)
+for why that matters to the request budget.
+
+`GHOSTCLOUD_SEED_KEY` gates `/cloud/v1/seedPool` — the endpoint that lets a solved
+puzzle put a working account into the shared pool. When it is set, the request
+must carry `x-seed-key`; the site sends none, so a seeding attempt then falls back
+to saving the account locally instead (which still works, just for that one
+player). Only set it if you intend to seed from `curl` yourself.
 
 ### 5. Verify
 
@@ -271,24 +284,90 @@ Measured 2026-10-10, from two independent locations:
 | …**from the deployed Worker on Cloudflare's network** | same |
 
 So it is not this machine, not the temp-mail domain, not the user-agent, and not
-the headers: Raccoon has put a puzzle/captcha gate in front of registration
-itself, and it refuses non-browser clients. Earlier the same endpoint refused
-individual domains with a *different* message ("temporary email … not supported"),
-which is what filled `blockedDomains` — that message is domain-specific and
-rotatable; this one is not.
+the headers. It is a **slider puzzle**, and it is solvable — by a human.
 
-The practical consequence for the app: **the account pool cannot refill.** The
-pool is drained one account per session and never refilled from the outside, so
-once it is empty the service is fully down regardless of how much Cloudflare
-quota is left. Check `pool N/6` in `diagMail` — if it is `0/6` *and*
-`raccoon.walled` is true, no player can start a game, and the honest player-facing
-message is the one they already get (`BUSY_MESSAGE`).
+### What the check actually is
 
-What the worker now does about it: it recognises the wall, stops the attempt
-immediately (no second pass, no other lane, no backoff) and says so in the log.
-Before that, a walled attempt still walked 3 lanes × 4 passes, spending provider
-quota and making the player wait ~45s for an answer that could not change. Now it
-fails in about 3s.
+Raccoon's own login page ships the widget
+(`https://www.raccoongame.com/assets/web/js/email-registration-puzzle.js`) and it
+is two endpoints, both read from that file and confirmed live:
+
+| Call | What it does |
+|---|---|
+| `GET /users/emailRegisterCaptcha?email=…&sn=…&t=…` | returns `{challenge_id, background, piece, width, height, piece_size, piece_y}` — the puzzle image and the piece as PNG data URIs, plus the geometry |
+| `POST /users/emailRegisterCaptchaVerify` `{email, sn, challenge_id, offset}` | checks where the piece landed: `offset = round(progress × (width − piece_size))`, in the image's own pixels |
+
+Registration then proceeds normally **for that `sn`**: `sendEmail` → code from
+the mailbox → `emailRegister` → `emailLogin`. Two things are easy to get wrong:
+
+- **The `sn` *is* the verification's identity.** Generate a fresh one for
+  `sendEmail` and the refusal comes straight back; it has to be the same `sn` the
+  challenge was fetched with. `/cloud/v1/sendEmail` now takes `sn` for this
+  reason.
+- **Raccoon rate-limits the puzzle per address** — `429 Too many puzzle attempts.
+  Please try again in N seconds` (a 180s window). Past that limit even a
+  brand-new challenge answers *"The puzzle has expired"*, which is why "expired"
+  is not the same thing as a slow human. Both relay endpoints return
+  `retry_after_seconds` so the UI waits instead of retrying into the limit.
+
+Measured: a deliberately wrong offset at 2s, 8s and 12.8s returns `400 The puzzle
+does not match. Please try again.` — the challenge is alive and the offset really
+is checked, so this is a human check and not a rubber stamp. A correct-but-late
+one, and any attempt made after the per-address limit, return `The puzzle has
+expired. Please refresh it.`
+
+### What the Worker does about it
+
+- **Relays the puzzle to the player instead of trying to pass it.** The Worker
+  never computes an offset — a machine solving the check would defeat the check.
+  `/cloud/v1/captchaChallenge` fetches a challenge and hands back the images and
+  the `sn`; `/cloud/v1/captchaVerify` forwards the human's drag. The player sees
+  exactly what they would see on raccoongame.com.
+- **Seeds the shared pool.** `POST /cloud/v1/seedPool {sn, token}` puts a working
+  account in the pool, so one solved puzzle serves many sessions instead of dying
+  with the player who solved it. Set `GHOSTCLOUD_SEED_KEY` to require an
+  `x-seed-key` header (recommended: the site's API key is public).
+- **Recognises the wall and stops the attempt immediately** — no second pass, no
+  other lane, no backoff. Before, a walled attempt walked 3 lanes × 4 passes,
+  spending provider quota and making the player wait ~45s for an answer that
+  could not change. Measured locally: the first attempt now answers in ~2.3s.
+- **Remembers it for a cooldown** (`GHOSTCLOUD_WALL_COOLDOWN_MS`, 10 min by
+  default) and refuses *automatic* registrations while it runs. This is what
+  protects the free-plan budget: a walled hub used to re-attempt pool fills every
+  20–60s around the clock, and every player retry re-probed the providers, all to
+  collect the same refusal. The automatic path can never solve a puzzle, so it
+  stays paused; the human path is never blocked by it.
+- **Tells the player the truth, and gives them the action.** `playerMessage()`
+  returns `OUTAGE_MESSAGE` for the wall — "…one slider puzzle, solved once. Open
+  your account settings, get a mailbox and solve it…" — and `BUSY_MESSAGE` only
+  for genuine congestion. Retrying cannot pass the wall, so "please try again in a
+  moment" would be a lie that also spends quota; the outage wording names the one
+  screen that does work.
+
+Measured end-to-end in workerd (`node .freebuff/test_wall_live.js`): attempt 1
+~2.3s and records `raccoonWallCooldownSeconds: 600`; attempt 2 answers in **0.1s**
+with zero outbound requests. `node .freebuff/test_raccoon_wall.js` pins the
+cooldown, the zero-request guarantee, the alarm suppression, the restart
+round-trip, and the message wording. `node .freebuff/test_puzzle_relay.js` pins
+the relay contract: real challenge with data-URI images and geometry, the `sn`
+that has to be reused, a wrong offset rejected rather than passed, the
+`needVerification` flag that makes the site open the puzzle, and seeding the pool
+exactly once per account.
+
+### Still unproven: the success path
+
+Every part of the relay is verified except the one that needs a human eye: **no
+correct-offset solve has been confirmed end-to-end from here.** Probing the
+puzzle repeatedly tripped Raccoon's per-address limit, after which even a
+brand-new challenge answers `"The puzzle has expired"` — so a recorded
+*successful* verify (`{verified: true}` → `sendEmail` → code) is still
+unconfirmed by the author of this change. It is the same two calls their own site
+makes, and the widget math was read off their file rather than guessed, but treat
+it as verified-by-construction until someone solves one.
+
+To confirm it in 30 seconds: open the site → Settings → Account → **Get temp
+mailbox** → **Solve check & continue** → drag the piece into the gap. A working
+run ends with `✓ Account created and shared` and `diagMail` showing `pool 1/6`.
 
 **Paths forward** (this needs a decision, not a patch):
 
@@ -321,9 +400,18 @@ fails in about 3s.
    `GHOSTCLOUD_INBOUND_KEY` + Cloudflare Email Routing → the Email Worker).
    Removes the free-provider rate limits and the domain blocklisting, but does
    not by itself defeat a client-side bot check.
-3. **Manual accounts.** Already implemented and wired to the site's
-   `getManualAccount()`: a player who has their own Raccoon account can supply
-   `{sn, token}` and skip registration entirely. This is the only lane that does
-   not touch Raccoon's registration endpoint at all, so it is the reliable
-   stopgap while the gate is up. These sessions take no registration slot and
-   their account is never pooled — the test above asserts both.
+3. **Manual accounts.** Wired to the site's `getManualAccount()`: a player who
+   has their own Raccoon account can supply `{sn, token}` and skip registration
+   entirely. These sessions take no registration slot and their account is never
+   pooled — the test above asserts both. The settings screen now also *creates*
+   an account through the puzzle (see above) and, when the mailbox came from this
+   site rather than the player's inbox, hands it to `seedPool` instead of keeping
+   it locally: one solved puzzle then serves every player after it, and two live
+   copies of one account cannot knock each other off.
+
+   The risk this carries, stated plainly: Raccoon put that check there to stop
+   automated signups, and rate-limits it per address. Relaying a human's solve
+   keeps the check meaningful — no offset is ever computed by a machine — but it
+   still means accounts are created from one shared egress address at whatever
+   rate players solve puzzles. If Raccoon tightens that limit, the honest answer
+   is an official arrangement with them rather than a cleverer relay.

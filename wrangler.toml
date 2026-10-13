@@ -43,12 +43,19 @@ GHOSTCLOUD_POOL_TARGET = "6"
 GHOSTCLOUD_REUSE_ACCOUNTS = "on"
 # Comma-separated mail.tm-shaped fallback providers (optional).
 GHOSTCLOUD_MAIL_PROVIDERS = "https://api.duckmail.sbs,https://api.mail.gw"
+# After Raccoon's bot wall is seen, stop attempting registrations for this long
+# (ms). Retrying cannot pass the wall and only spends provider quota plus the
+# free plan's 100k/day Durable Object budget, so a walled hub now costs one alarm
+# per cooldown instead of one every 20s. Default 600000 (10 min).
+GHOSTCLOUD_WALL_COOLDOWN_MS = "600000"
 
 # ── Secrets (set these, do NOT commit them) ─────────────────────────────────
 #   npx wrangler secret put GHOSTCLOUD_PRO_CODE      # the Pro code players type
 #   npx wrangler secret put GHOSTCLOUD_PRO_EPOCH     # bump to invalidate Pro tokens
 #   npx wrangler secret put GHOSTCLOUD_INBOUND_KEY   # own-domain mail lane secret
 #   npx wrangler secret put GHOSTCLOUD_MAIL_DOMAIN   # your domain -> enables the durable lane
+#   npx wrangler secret put GHOSTCLOUD_SEED_KEY     # require x-seed-key on /cloud/v1/seedPool
+#                                                   # (optional; the site's API key is public)
 
 [observability]
 enabled = true
