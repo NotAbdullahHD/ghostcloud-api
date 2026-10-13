@@ -25,6 +25,15 @@ import SITES from "./sites.js";
 
 const RACCOON_HOST = "www.raccoongame.com";
 const RACCOON_TIMEOUT_MS = 20000;
+// Bumped whenever the HTTP contract changes shape, and reported by
+// /cloud/v1/capabilities. The site asks for it on the account screen: a stale
+// deploy used to be indistinguishable from a code bug, which is exactly how
+// "I updated the API but nothing changed" happens. The website checks this
+// string and says so out loud instead of pretending.
+const API_VERSION = "2.2.0";
+// Capabilities the site probes for. Anything missing means the running Worker is
+// an older build than the site expects.
+const API_CAPABILITIES = { puzzle: true, manualRegister: true, seedPool: true, verificationEvents: true };
 // Raccoon's registration endpoints sit behind nginx and answer a bare fetch UA
 // with the same puzzle refusal they answer a browser with, so this is not a
 // disguise — it is just the UA the mobile client and the site both send.
@@ -373,6 +382,7 @@ export class Hub {
       case "/cloud/v1/activatePro": return this.handleActivatePro(ctx);
       case "/cloud/v1/verifyPro": return this.handleVerifyPro(ctx);
       case "/cloud/v1/diagMail": return this.handleDiagMail(ctx);
+      case "/cloud/v1/capabilities": return json({ apiVersion: API_VERSION, capabilities: API_CAPABILITIES });
       case "/cloud/v1/embed-data": return this.handleEmbedData(ctx);
       default: return json({ error: "Not found." }, 404);
     }
@@ -496,7 +506,21 @@ export class Hub {
   // remaining lanes, passes and providers after this is pure waste — it burns
   // subrequests, spends provider quota, and delays the player's error by ~45s
   // for an answer that will not change. Recognise it and stop.
-  isRaccoonWall(msg) { return /puzzle|captcha|human|robot|slide|too frequent/i.test(String(msg || "")); }
+  // The refusal that means "pass the human check first".
+  // Raccoon words its refusal "Please complete the puzzle verification.", so
+  // `verification` has to count — without it the refusal was classified as a
+  // generic error, the site printed the raw sentence, and the player was told to
+  // complete a check that was never shown.
+  //
+  // It must NOT count for our own wording: "no verification code from <lane>" is
+  // a dead temp-mail lane, and reading that as the wall would pause every
+  // registration for the whole cooldown because one provider blinked. Ours is
+  // excluded first, then anything human-check shaped matches.
+  isRaccoonWall(msg) {
+    const m = String(msg || "");
+    if (/no verification code|verification code from/i.test(m)) return false;
+    return /puzzle|captcha|human|robot|slide|verification|too frequent/i.test(m);
+  }
   // Remember the wall and stop attempting registrations for a cooldown. The
   // wall refuses every address, so a retry cannot change the answer — it only
   // spends mail-provider quota, a Raccoon request, and (on the free plan)
@@ -512,6 +536,17 @@ export class Hub {
   // What a player reads is behaviour worth testing: the wall/busy wording
   // distinction is the whole point of the outage handling.
   playerMessageFor(e) { return playerMessage(e); }
+  // The player-facing error plus the machine-readable hint the site needs to act
+  // on it. The prose tells a *human* to go and solve the check; `needVerification`
+  // lets the site take them there in one click instead of leaving them to find a
+  // screen they have never opened. The field is additive, so an older site
+  // simply ignores it. This is the fix for "it says complete verification but I
+  // cannot see any verification": the session error now carries the fact that a
+  // check exists, and the site can open it.
+  sessionErrorEvent(e) {
+    const wall = !!(e && e.raccoonWall) || this.isRaccoonWall(e && e.message);
+    return { status: "error", error: playerMessage(e), needVerification: wall };
+  }
   wallCooldownError() {
     if (Date.now() >= this.raccoonWalledUntil) return null;
     const left = Math.ceil((this.raccoonWalledUntil - Date.now()) / 1000);
@@ -1087,7 +1122,7 @@ export class Hub {
       w.push({ status: "slot_reserved" });
       this.runCreateSessionFlow(w).catch((e) => {
         console.log(`setup failed for ${String(w.sessionUuid || "?").slice(0, 8)} — ${e.message}`);
-        w.push({ status: "error", error: playerMessage(e) });
+        w.push(this.sessionErrorEvent(e));
         try { w.controller.close(); } catch {}
       });
     }
@@ -1112,7 +1147,7 @@ export class Hub {
     } else {
       this.runCreateSessionFlow(waiter).catch((e) => {
         console.log(`setup failed for ${String(waiter.sessionUuid || "?").slice(0, 8)} — ${e.message}`);
-        waiter.push({ status: "error", error: playerMessage(e) });
+        waiter.push(this.sessionErrorEvent(e));
         try { waiter.controller.close(); } catch {}
       });
     }
@@ -1263,7 +1298,7 @@ export class Hub {
     } catch (e) {
       this.releaseAccountSlotFor(w);
       console.log(`creation failed for ${uuid.slice(0, 8)} — ${e.message}`);
-      w.push({ status: "error", error: playerMessage(e) });
+      w.push(this.sessionErrorEvent(e));
       this.killSession(uuid, "creation_error");
     } finally {
       try { w.controller.close(); } catch {}
@@ -1528,10 +1563,36 @@ export class Hub {
     const base = { sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" };
     const headers = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" };
     try {
-      await this.raccoonFetch("/users/emailRegister", { method: "POST", headers, body: new URLSearchParams({ email, code, password, phone: phone || "1", country: country || "Brazil", ...base }) });
+      const regRes = await this.raccoonFetch("/users/emailRegister", { method: "POST", headers, body: new URLSearchParams({ email, code, password, phone: phone || "1", country: country || "Brazil", ...base }) });
+      // The register response used to be thrown away, so a refusal here surfaced
+      // as a bare "Login failed" — or, worse, as Raccoon's own sentence about a
+      // human check the player had no way to see. Raccoon binds the verification
+      // to `sn`, so an sn that went stale between the puzzle and this call is
+      // refused with that same sentence; the fix is to say so and let the site
+      // re-open the check. Deliberately NOT noteRaccoonWall(): a stale sn is one
+      // attempt failing, not the service-wide wall, and pausing every
+      // registration for 10 minutes over it would be a much bigger outage.
+      const regRejected = this.raccoonRejectedMail(await regRes.json().catch(() => null));
+      if (regRejected) {
+        const wall = this.isRaccoonWall(regRejected);
+        console.log(`manualRegister refused for ${email}: ${regRejected}`);
+        return json({
+          error: wall ? "The human check went stale before the account was made — solve it again and the code comes with it." : regRejected,
+          raccoon: regRejected,
+          needVerification: wall,
+          retry_after_seconds: null,
+        }, 400);
+      }
       const loginRes = await this.raccoonFetch("/users/emailLogin", { method: "POST", headers, body: new URLSearchParams({ email, password, ...base }) });
       const loginData = await parseJsonResponse(loginRes, "Raccoon login");
-      if (loginData.status !== 200) throw new Error("Login failed");
+      if (loginData.status !== 200) {
+        // Report what Raccoon actually said. "Login failed" hid every reason —
+        // a blocklisted domain, a taken address, a wrong password — behind one
+        // sentence that told the player nothing they could act on.
+        const why = loginData.msg || "The game service refused the login after registering.";
+        console.log(`manualRegister login refused for ${email}: ${why}`);
+        return json({ error: why, raccoon: loginData, needVerification: this.isRaccoonWall(why) }, 400);
+      }
       let userToken = loginData.data?.user_token || "";
       const cookie = loginRes.headers.get("set-cookie");
       if (cookie) { const m = cookie.match(/as_user_token=([^;]+)/); if (m) userToken = m[1]; }
