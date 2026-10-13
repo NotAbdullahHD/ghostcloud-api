@@ -367,27 +367,98 @@ that has to be reused, a wrong offset rejected rather than passed, the
 `needVerification` flag that makes the site open the puzzle, and seeding the pool
 exactly once per account.
 
-### Still unproven: the success path
+### The session cookie — the bug that made every solve look expired
 
-Every part of the relay is verified except the one that needs a human eye: **no
-correct-offset solve has been confirmed end-to-end from here.** Probing the
-puzzle repeatedly tripped Raccoon's per-address limit, after which even a
-brand-new challenge answers `"The puzzle has expired"` — so a recorded
-*successful* verify (`{verified: true}` → `sendEmail` → code) is still
-unconfirmed by the author of this change. It is the same two calls their own site
-makes, and the widget math was read off their file rather than guessed, but treat
-it as verified-by-construction until someone solves one.
+Raccoon issues the registration puzzle inside a Laravel session and returns it as
+`raccoongame_session=…` on the challenge response. Their own widget is a
+same-origin `$.ajax` call, so the browser sends that cookie back automatically;
+our relay is stateless, so it did not, and `/emailRegisterCaptchaVerify` — which
+looks the pending challenge up *in that session* — answered:
 
-To confirm it in 30 seconds: open the site → Settings → Account → **Get temp
-mailbox** → **Send code** → drag the piece into the gap → **Register & save**. A
-working run ends with `✓ Account created and shared` and `diagMail` showing
-`pool 1/6`.
+| request | answer |
+|---|---|
+| verify **without** the cookie | `The puzzle has expired. Please refresh it.` |
+| verify **with** the cookie, same wrong offset | `The puzzle does not match. Please try again.` |
+
+Both were sent back to back, at the same millisecond-scale latency, so "expired"
+was never about time. It read exactly like a short solve window, which is where
+the earlier "Raccoon is throttling this IP" note came from — wrong. The cookie is
+the whole difference, and a *correct* solve would have been refused the same way.
+
+The Worker now keeps the session per `sn` (`captureRaccoonSession`, 30 min TTL,
+oldest-first trim) and sends it on challenge → verify → `sendEmail` →
+`emailRegister` → `emailLogin`, re-capturing it on every response because Raccoon
+rotates it each time.
+
+### Verified: a human solve is accepted
+
+Solved by hand (reading the challenge, dragging the piece) three times against
+this Worker, all through the relay:
+
+| offset | result |
+|---|---|
+| 251 | `{verified: true}` → `sendEmail` → `{"status":200,"msg":"success"}` |
+| 244 | `{verified: true}` |
+| 239 | `{verified: true}` → `sendEmail` → `{"status":200,"msg":"success"}` |
+
+A challenge fetched 19–21s before the drag still verified, and a challenge left
+~90s did not, so the window is short (order of a minute) — worth knowing, because
+the site's *Send code* step is what starts that clock.
+
+To see the working half in 30 seconds: open the site → Settings → Account → **Get
+temp mailbox** → **Send code** → drag the piece into the gap. The puzzle clears
+and the code goes out (that is the part this document's fix repairs). **Register &
+save** is the step Raccoon currently refuses for everyone — see the blocker
+section above before treating that failure as a bug in this Worker.
 
 The check only exists inside that step. It is requested by *Send code* and it is
 bound to the mailbox in the field above it, so there is nothing to see on the
 account screen before you press it — which is exactly why the site now opens this
 screen and highlights that button whenever the game service refuses for want of
 the check.
+
+### Known blocker: Raccoon refuses `emailRegister` itself
+
+As of this writing, **account creation is refused by Raccoon** — with a freshly
+verified `sn`, in the same session:
+
+```
+verify(offset, fresh)  → {"status":200}          # accepted
+sendEmail(same sn)     → {"status":200,"msg":"success"}   # accepted, code requested
+emailRegister(same sn) → {"status":400,
+  "msg":"Human verification is required. Please request a new email code."}
+```
+
+That was 1.3s after `sendEmail` accepted the verification, so it is not latency
+and not a stale check. `verify` alone is not enough either, and re-verifying the
+same challenge is refused (`The puzzle has expired` — challenges are single-use).
+The error is returned *before* the code is looked at, so a bogus code and a real
+one get the same answer.
+
+The decisive detail: **Raccoon's own website fails identically.** A player
+registering at raccoongame.com, solving the puzzle, receiving the code and
+submitting it gets this exact sentence — five times running, with five fresh
+codes. Their client sends the same fields we do, in the same order. So the
+verification is accepted for `sendEmail` and not for `emailRegister` on their
+side, for everyone, including their own users.
+
+The most likely reading is that `sendEmail` spends the verification and
+`emailRegister` wants its own, which their client never re-does. If that is right,
+the client-side fix is: when `~/cloud/v1/manualRegister` answers
+`needVerification`, re-run the puzzle and retry the register — the site already
+receives that flag. It is **not** implemented as an automatic retry, because the
+one supporting test (a fresh `verify` immediately before `register`, with no
+`sendEmail` in between) was also refused; burning an extra human solve on a guess
+would be worse than saying so.
+
+What the site does instead: it keeps the code the player typed, says the refusal
+came from the game service, and points at the check — so a retry is one click
+rather than five codes.
+
+Also note: availability of **Sign in with Google** appeared at the same time,
+gated to three hard-coded device ids in Raccoon's page. If registration stays
+refused, an official login method is the honest way forward rather than more
+puzzle work.
 
 ## "I redeployed and nothing changed"
 
