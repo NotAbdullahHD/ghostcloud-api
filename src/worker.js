@@ -25,6 +25,11 @@ import SITES from "./sites.js";
 
 const RACCOON_HOST = "www.raccoongame.com";
 const RACCOON_TIMEOUT_MS = 20000;
+// Raccoon's registration endpoints sit behind nginx and answer a bare fetch UA
+// with the same puzzle refusal they answer a browser with, so this is not a
+// disguise — it is just the UA the mobile client and the site both send.
+const BROWSER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 const MAX_SESSION_SECONDS = 19 * 60;
 const DEFAULT_SESSION_SECONDS = 19 * 60;
 const WS_OPEN = 1;
@@ -150,7 +155,13 @@ async function parseJsonResponse(res, what) {
 // provider name, an HTTP code, or a "why" — all of that is accurate and none of
 // it is the player's problem.
 const BUSY_MESSAGE = "We're at our busiest right now and couldn't set up your game in time — please try again in a moment. Nothing is wrong on your side.";
+// Shown only while Raccoon's bot wall is up. That is a *known outage*, not a busy
+// spell: every retry gets the same refusal, so telling the player to retry is a
+// lie that also spends quota. Say what is actually true and point at the path
+// that does work — a player's own account skips registration entirely.
+const OUTAGE_MESSAGE = "The game service now asks for a quick human check before it opens an account: one slider puzzle, solved once. Open your account settings, get a mailbox and solve it — after that your games start normally, and so do everyone else's.";
 function playerMessage(e) {
+  if (e && e.raccoonWall) return OUTAGE_MESSAGE;
   if (e && e.busy) return BUSY_MESSAGE;
   const m = String((e && e.message) || "");
   if (/at capacity|rate limit|heavy load|briefly unavailable|invalid response|no response|no verification code|No mail domains|blocklisted by Raccoon|Raccoon refused/i.test(m)) {
@@ -245,6 +256,11 @@ export class Hub {
     this.PRO_EPOCH = env.GHOSTCLOUD_PRO_EPOCH || "1";
     this.PRO_DAILY_SECONDS = 8 * 3600;
     this.INBOUND_KEY = env.GHOSTCLOUD_INBOUND_KEY || "";
+    // Optional: when set, /cloud/v1/seedPool requires it in `x-seed-key`.
+    this.SEED_KEY = env.GHOSTCLOUD_SEED_KEY || "";
+    // How long to stop attempting registrations after Raccoon's wall is seen.
+    // 10 min by default; override with GHOSTCLOUD_WALL_COOLDOWN_MS.
+    this.RACCOON_WALL_COOLDOWN_MS = Math.max(60000, Number(env.GHOSTCLOUD_WALL_COOLDOWN_MS || 600000));
 
     // ── live state (in memory while the object is active) ──
     this.sessions = new Map();
@@ -269,6 +285,7 @@ export class Hub {
     this.lastDashboardAt = 0;
     this.lastPresenceSweepAt = 0;
     this.poolFilling = false;
+    this.raccoonWalledUntil = 0;
 
     // ── durable bits (survive eviction between deploys) ──
     this.ready = state.blockConcurrencyWhile(async () => {
@@ -279,6 +296,8 @@ export class Hub {
         if (Array.isArray(savedPro)) this.proTokens = new Map(savedPro);
         const savedBlocked = await this.storage.get("blockedDomains");
         if (Array.isArray(savedBlocked)) this.blockedMailDomains = new Set(savedBlocked);
+        const savedWall = await this.storage.get("raccoonWalledUntil");
+        if (typeof savedWall === "number" && savedWall > Date.now()) this.raccoonWalledUntil = savedWall;
       } catch (e) {
         console.log(`state load failed: ${e.message}`);
       }
@@ -348,6 +367,9 @@ export class Hub {
       case "/cloud/v1/getCode": return this.handleGetCode(ctx);
       case "/cloud/v1/sendEmail": return this.handleSendEmail(ctx);
       case "/cloud/v1/manualRegister": return this.handleManualRegister(ctx);
+      case "/cloud/v1/captchaChallenge": return this.handleCaptchaChallenge(ctx);
+      case "/cloud/v1/captchaVerify": return this.handleCaptchaVerify(ctx);
+      case "/cloud/v1/seedPool": return this.handleSeedPool(ctx);
       case "/cloud/v1/activatePro": return this.handleActivatePro(ctx);
       case "/cloud/v1/verifyPro": return this.handleVerifyPro(ctx);
       case "/cloud/v1/diagMail": return this.handleDiagMail(ctx);
@@ -475,6 +497,26 @@ export class Hub {
   // subrequests, spends provider quota, and delays the player's error by ~45s
   // for an answer that will not change. Recognise it and stop.
   isRaccoonWall(msg) { return /puzzle|captcha|human|robot|slide|too frequent/i.test(String(msg || "")); }
+  // Remember the wall and stop attempting registrations for a cooldown. The
+  // wall refuses every address, so a retry cannot change the answer — it only
+  // spends mail-provider quota, a Raccoon request, and (on the free plan)
+  // Durable Object requests against a 100k/day budget. Without this the pool-fill
+  // loop kept re-attempting every 20-60s around the clock for nothing.
+  noteRaccoonWall(why) {
+    this.raccoonWalledUntil = Date.now() + this.RACCOON_WALL_COOLDOWN_MS;
+    this.state.waitUntil(this.storage.put("raccoonWalledUntil", this.raccoonWalledUntil).catch(() => {}));
+    console.log(`raccoon wall (${String(why || "").slice(0, 80)}) — pausing registrations for ${Math.round(this.RACCOON_WALL_COOLDOWN_MS / 1000)}s`);
+  }
+  // Exposed on the class (not as a module export — a Worker module may only
+  // export handlers/classes, and a bare string export stops workerd booting).
+  // What a player reads is behaviour worth testing: the wall/busy wording
+  // distinction is the whole point of the outage handling.
+  playerMessageFor(e) { return playerMessage(e); }
+  wallCooldownError() {
+    if (Date.now() >= this.raccoonWalledUntil) return null;
+    const left = Math.ceil((this.raccoonWalledUntil - Date.now()) / 1000);
+    return Object.assign(new Error(`raccoon registration wall in cooldown (${left}s left)`), { busy: true, raccoonWall: true });
+  }
   markDomainBlocked(email, why) {
     const dom = String(email || "").split("@")[1];
     if (!dom || !this.isTempBlockedMessage(why) || this.blockedMailDomains.has(dom)) return;
@@ -632,6 +674,9 @@ export class Hub {
     };
   }
   async createAccountRaw() {
+    // While the wall is in cooldown, return without spending a single request.
+    const walled = this.wallCooldownError();
+    if (walled) throw walled;
     const passBackoffMs = [3000, 8000, 20000];
     // A lane that just answered 429 is not going to answer differently two
     // seconds later, and every retry against it is another request on a meter
@@ -663,7 +708,7 @@ export class Hub {
           if (rejected) {
             if (this.isRaccoonWall(rejected)) {
               hardStop = Object.assign(new Error(`Raccoon is gating registration behind a bot check: ${rejected}`), { busy: true, raccoonWall: true });
-              console.log(`raccoon wall: "${rejected}" — aborting account creation (no domain or lane change will pass this)`);
+              this.noteRaccoonWall(rejected);
               break;
             }
             this.markDomainBlocked(email, rejected);
@@ -686,7 +731,7 @@ export class Hub {
           if (regRejected) {
             if (this.isRaccoonWall(regRejected)) {
               hardStop = Object.assign(new Error(`Raccoon is gating registration behind a bot check: ${regRejected}`), { busy: true, raccoonWall: true });
-              console.log(`raccoon wall at registration: "${regRejected}" — aborting account creation`);
+              this.noteRaccoonWall(regRejected);
               break;
             }
             this.markDomainBlocked(email, regRejected);
@@ -705,7 +750,7 @@ export class Hub {
           this.noteProviderOk(lane.id);
           return { sn, token: userToken };
         } catch (e) {
-          if (this.isRaccoonWall(e.message)) { hardStop = Object.assign(e, { busy: true, raccoonWall: true }); break; }
+          if (this.isRaccoonWall(e.message)) { hardStop = Object.assign(e, { busy: true, raccoonWall: true }); this.noteRaccoonWall(e.message); break; }
           lastErr = e;
           if (e && e.throttled) throttledLanes.add(lane.id);
           // Logged per lane, as it happens. The old code only logged `lastErr`
@@ -896,7 +941,13 @@ export class Hub {
   nextTickDelay() {
     if (this.sessions.size > 0) return TICK_MS;
     if (this.capacityWaiters.some((w) => !w.ended)) return TICK_MS;
-    if (this.pool.length < this.POOL_TARGET) return Math.max(POOL_FILL_MIN_DELAY_MS, this.nextPoolFillAt - Date.now());
+    if (this.pool.length < this.POOL_TARGET) {
+      // While the wall is up a fill cannot succeed. Wake once when the cooldown
+      // expires rather than re-arming a billed DO alarm every 20s for nothing.
+      const wallLeft = this.raccoonWalledUntil - Date.now();
+      if (wallLeft > 0) return Math.max(1000, wallLeft);
+      return Math.max(POOL_FILL_MIN_DELAY_MS, this.nextPoolFillAt - Date.now());
+    }
     return 0;
   }
   ensureTicking() {
@@ -1001,7 +1052,7 @@ export class Hub {
     // Top the pool up one pass at a time, never on top of itself. If every lane
     // is refused the attempts back off exponentially, so a broken setup can't
     // burn the free plan's daily request budget on idle ticks.
-    if (this.pool.length < this.POOL_TARGET && !this.poolFilling && now >= this.nextPoolFillAt) {
+    if (this.pool.length < this.POOL_TARGET && !this.poolFilling && now >= this.nextPoolFillAt && now >= this.raccoonWalledUntil) {
       await this.fillPoolOnce();
       // Arm the next attempt *after* the fill, never before it. Setting the
       // deadline up front meant a fill slower than POOL_FILL_INTERVAL_MS left
@@ -1359,21 +1410,117 @@ export class Hub {
     try { return json({ code: await lane.read(body) }); }
     catch (e) { return json({ error: e.message }, 500); }
   }
+  // ══ Registration puzzle (Raccoon's human check) ══════════════════════════
+  // Email registration is gated: the client asks for a challenge, a human drags
+  // the piece into the gap, and the server marks that `sn` verified before it
+  // will send a registration code. The Worker does not solve this and must not —
+  // what it does is fetch the challenge and hand it to the player's own browser,
+  // exactly as raccoongame.com does, so the human check reaches a human. The sn
+  // returned here has to be reused by sendEmail/emailRegister: the verification
+  // is bound to it, so a fresh sn means starting over.
+  //
+  // Raccoon rate-limits the puzzle too ("Too many puzzle attempts", 180s window)
+  // and reports it with the same shape as a refusal, so both endpoints surface
+  // `retry_after_seconds` for the UI to count down instead of retrying into it.
+  puzzleRetryAfter(data) {
+    const n = Number(data && data.data && data.data.retry_after_seconds);
+    return Number.isFinite(n) && n > 0 ? Math.ceil(n) : null;
+  }
+  async handleCaptchaChallenge(ctx) {
+    const email = String((ctx.body || {}).email || "").trim();
+    if (!email) return json({ error: "Enter an email address first." }, 400);
+    const sn = generateSN();
+    const t0 = Date.now();
+    try {
+      const r = await this.raccoonFetch(`/users/emailRegisterCaptcha?email=${encodeURIComponent(email)}&sn=${sn}&t=${Date.now()}`, {
+        headers: { "user-agent": BROWSER_UA, "x-requested-with": "XMLHttpRequest" },
+      });
+      const d = await r.json().catch(() => null);
+      if (!d || d.status !== 200 || !d.data || !d.data.challenge_id) {
+        console.log(`puzzle challenge refused for ${email} (HTTP ${r.status}): ${JSON.stringify(d).slice(0, 160)}`);
+        return json({
+          error: (d && d.msg) || "Could not load the verification.",
+          retry_after_seconds: this.puzzleRetryAfter(d),
+        }, 200);
+      }
+      const c = d.data;
+      return json({
+        sn,
+        email,
+        ms: Date.now() - t0,
+        challenge: {
+          challenge_id: c.challenge_id, background: c.background, piece: c.piece,
+          width: c.width, height: c.height, piece_size: c.piece_size, piece_y: c.piece_y,
+        },
+      });
+    } catch (e) { return json({ error: e.message }, 500); }
+  }
+  async handleCaptchaVerify(ctx) {
+    const { email, sn, challenge_id, offset } = ctx.body || {};
+    if (!email || !sn || !challenge_id || offset === undefined || offset === null) {
+      return json({ error: "Missing puzzle fields." }, 400);
+    }
+    try {
+      const r = await this.raccoonFetch("/users/emailRegisterCaptchaVerify", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded; charset=UTF-8", "user-agent": BROWSER_UA, "x-requested-with": "XMLHttpRequest" },
+        body: new URLSearchParams({ email, sn, challenge_id: String(challenge_id), offset: String(offset) }),
+      });
+      const d = await r.json().catch(() => null);
+      if (d && d.status === 200) return json({ verified: true, sn });
+      console.log(`puzzle verify refused (HTTP ${r.status}): ${JSON.stringify(d).slice(0, 160)}`);
+      return json({
+        verified: false,
+        error: (d && d.msg) || "Verification failed.",
+        retry_after_seconds: this.puzzleRetryAfter(d),
+      });
+    } catch (e) { return json({ error: e.message }, 500); }
+  }
   async handleSendEmail(ctx) {
     const { email, password } = ctx.body || {};
     if (!email || !password) return json({ error: "Missing email or password." }, 400);
-    const sn = generateSN();
+    // The caller passes back the sn it solved the puzzle with; generating a new
+    // one here would throw the verification away and get the refusal again.
+    const sn = String((ctx.body || {}).sn || "").trim() || generateSN();
     try {
       const r = await this.raccoonFetch("/users/sendEmail", {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" },
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": BROWSER_UA },
         body: new URLSearchParams({ email, type: "register", sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" }),
       });
       const data = await r.json().catch(() => ({}));
       console.log(`sendEmail ${email} → HTTP ${r.status} ${JSON.stringify(data)}`);
-      if (data.status && data.status !== 200) return json({ error: data.msg || `Raccoon rejected: ${JSON.stringify(data)}`, raccoon: data }, 400);
+      if (data.status && data.status !== 200) {
+        return json({
+          error: data.msg || `Raccoon rejected: ${JSON.stringify(data)}`,
+          raccoon: data,
+          // Tells the site to open the puzzle instead of showing an error: the
+          // refusal is a human check, not a broken state.
+          needVerification: this.isRaccoonWall(data.msg),
+          retry_after_seconds: this.puzzleRetryAfter(data),
+        }, 400);
+      }
       return json({ sn, raccoon: data });
     } catch (e) { return json({ error: e.message }, 500); }
+  }
+  // Hand a working account to the shared pool. Raccoon's puzzle means every new
+  // account costs a human a few seconds of dragging, so one solved account should
+  // serve as many games as possible instead of dying with the session that made
+  // it. Optional GHOSTCLOUD_SEED_KEY keeps strangers from filling the pool with
+  // junk (the site's API key is public, so it cannot be the only gate).
+  async handleSeedPool(ctx) {
+    const { sn, token } = ctx.body || {};
+    if (!sn || !token) return json({ error: "Missing sn or token." }, 400);
+    if (this.SEED_KEY && ctx.request.headers.get("x-seed-key") !== this.SEED_KEY) {
+      return json({ error: "Bad seed key." }, 403);
+    }
+    if (this.pool.some((a) => a.token === token)) return json({ seeded: false, reason: "already in the pool", pool: this.pool.length });
+    if (this.pool.length >= this.POOL_TARGET) return json({ seeded: false, reason: "pool already full", pool: this.pool.length });
+    this.pool.push({ sn, token, plays: 0 });
+    console.log(`pool: seeded by a player — ${this.pool.length}/${this.POOL_TARGET}`);
+    this.state.waitUntil(this.savePool());
+    this.ensureTicking();
+    return json({ seeded: true, pool: this.pool.length, target: this.POOL_TARGET });
   }
   async handleManualRegister(ctx) {
     const { sn, email, password, code, phone, country } = ctx.body || {};
@@ -1453,6 +1600,9 @@ export class Hub {
         totalPlays: this.pool.reduce((n, a) => n + (a.plays || 0), 0),
       },
       blockedDomains: [...this.blockedMailDomains],
+      // Non-zero means Raccoon's wall was seen recently and registrations are
+      // paused, so no amount of retrying will start a game.
+      raccoonWallCooldownSeconds: Math.max(0, Math.ceil((this.raccoonWalledUntil - Date.now()) / 1000)),
       // Last error per lane. Without this the only way to find out which lane is
       // wedged — and why — was a live `wrangler tail`.
       laneStats: Object.fromEntries(this.allLanes().map((l) => {
