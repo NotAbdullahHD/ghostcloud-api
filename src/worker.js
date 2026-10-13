@@ -278,6 +278,15 @@ export class Hub {
     this.siteUsage = new Map();
     this.ipLimits = new Map();
     this.embedIpLimits = new Map();
+    // Raccoon keeps the pending registration puzzle in a Laravel session and
+    // hands that session back as a `raccoongame_session` cookie on the challenge
+    // response. `/emailRegisterCaptchaVerify` looks the challenge up *in that
+    // session* — send the verify without it and the answer is not "wrong
+    // position", it is "The puzzle has expired", which is indistinguishable from
+    // a real expiry and made the whole relay look broken. So the session is kept
+    // here, keyed by sn, for the few seconds between challenge → verify →
+    // sendEmail → emailRegister, and sent on every one of those calls.
+    this.raccoonSessions = new Map(); // sn → { cookie, at }
     this.accountCreators = 0; // registrations in flight (global — see ACCOUNT_CREATE_MAX)
     this.accountWaiters = []; // players queued for a registration slot, oldest first
     this.capacityWaiters = [];
@@ -696,6 +705,50 @@ export class Hub {
   // ══ Raccoon calls ═══════════════════════════════════════════════════════
   raccoonFetch(pathAndQuery, opts = {}) {
     return fetchWithTimeout(`https://${RACCOON_HOST}${pathAndQuery}`, opts);
+  }
+  // ── Raccoon session for a registration puzzle ────────────────────────────
+  // Verified against Raccoon directly: the same wrong offset answers
+  // "The puzzle has expired. Please refresh it." without the session cookie and
+  // "The puzzle does not match. Please try again." with it. A missing cookie is
+  // what made every solve look expired.
+  static get PUZZLE_SESSION_TTL_MS() { return 30 * 60 * 1000; }
+  captureRaccoonSession(sn, res) {
+    if (!sn || !res || !res.headers) return;
+    const jar = (typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : null)
+      || (res.headers.get("set-cookie") ? [res.headers.get("set-cookie")] : []);
+    if (!jar.length) return;
+    // name=value only: re-sending an expiry or a path back to the server is
+    // noise, and one malformed attribute can void the whole Cookie header.
+    const pairs = jar.map((c) => String(c).split(";")[0].trim()).filter(Boolean);
+    if (!pairs.length) return;
+    const existing = this.raccoonSessions.get(sn);
+    const merged = new Map();
+    for (const p of (existing ? existing.cookie.split("; ") : []).concat(pairs)) {
+      const eq = p.indexOf("=");
+      if (eq > 0) merged.set(p.slice(0, eq), p.slice(eq + 1));
+    }
+    this.raccoonSessions.set(sn, {
+      cookie: [...merged].map(([k, v]) => `${k}=${v}`).join("; "),
+      at: Date.now(),
+    });
+    this.pruneRaccoonSessions();
+  }
+  pruneRaccoonSessions() {
+    const now = Date.now();
+    for (const [k, v] of this.raccoonSessions) {
+      if (now - v.at > Hub.PUZZLE_SESSION_TTL_MS) this.raccoonSessions.delete(k);
+    }
+    // Insertion order is oldest-first, so trimming the head is trimming the oldest.
+    while (this.raccoonSessions.size > 200) {
+      const oldest = this.raccoonSessions.keys().next().value;
+      this.raccoonSessions.delete(oldest);
+    }
+  }
+  raccoonSessionHeader(sn) {
+    const held = sn && this.raccoonSessions.get(sn);
+    if (!held) return {};
+    if (Date.now() - held.at > Hub.PUZZLE_SESSION_TTL_MS) { this.raccoonSessions.delete(sn); return {}; }
+    return { cookie: held.cookie };
   }
   gameHeaders(token) {
     return {
@@ -1470,6 +1523,9 @@ export class Hub {
       const r = await this.raccoonFetch(`/users/emailRegisterCaptcha?email=${encodeURIComponent(email)}&sn=${sn}&t=${Date.now()}`, {
         headers: { "user-agent": BROWSER_UA, "x-requested-with": "XMLHttpRequest" },
       });
+      // Keep the session this challenge was issued into — the verify and the
+      // registration that follows are only valid inside it.
+      this.captureRaccoonSession(sn, r);
       const d = await r.json().catch(() => null);
       if (!d || d.status !== 200 || !d.data || !d.data.challenge_id) {
         console.log(`puzzle challenge refused for ${email} (HTTP ${r.status}): ${JSON.stringify(d).slice(0, 160)}`);
@@ -1498,9 +1554,17 @@ export class Hub {
     try {
       const r = await this.raccoonFetch("/users/emailRegisterCaptchaVerify", {
         method: "POST",
-        headers: { "content-type": "application/x-www-form-urlencoded; charset=UTF-8", "user-agent": BROWSER_UA, "x-requested-with": "XMLHttpRequest" },
+        headers: {
+          "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "user-agent": BROWSER_UA,
+          "x-requested-with": "XMLHttpRequest",
+          // Without this the answer is always "The puzzle has expired": the
+          // challenge lives in the session, and the session is the cookie.
+          ...this.raccoonSessionHeader(sn),
+        },
         body: new URLSearchParams({ email, sn, challenge_id: String(challenge_id), offset: String(offset) }),
       });
+      this.captureRaccoonSession(sn, r); // it may rotate the session on success
       const d = await r.json().catch(() => null);
       if (d && d.status === 200) return json({ verified: true, sn });
       console.log(`puzzle verify refused (HTTP ${r.status}): ${JSON.stringify(d).slice(0, 160)}`);
@@ -1520,9 +1584,18 @@ export class Hub {
     try {
       const r = await this.raccoonFetch("/users/sendEmail", {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": BROWSER_UA },
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": BROWSER_UA,
+          // The verified `sn` is recorded in the session, so this call has to
+          // arrive inside that same session or the registration is refused with
+          // "Please complete the puzzle verification." even though it was just
+          // completed — which is exactly what the player was seeing.
+          ...this.raccoonSessionHeader(sn),
+        },
         body: new URLSearchParams({ email, type: "register", sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" }),
       });
+      this.captureRaccoonSession(sn, r);
       const data = await r.json().catch(() => ({}));
       console.log(`sendEmail ${email} → HTTP ${r.status} ${JSON.stringify(data)}`);
       if (data.status && data.status !== 200) {
@@ -1561,7 +1634,7 @@ export class Hub {
     const { sn, email, password, code, phone, country } = ctx.body || {};
     if (!sn || !email || !password || !code) return json({ error: "Missing sn, email, password or code." }, 400);
     const base = { sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" };
-    const headers = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" };
+    const headers = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36", ...this.raccoonSessionHeader(sn) };
     try {
       const regRes = await this.raccoonFetch("/users/emailRegister", { method: "POST", headers, body: new URLSearchParams({ email, code, password, phone: phone || "1", country: country || "Brazil", ...base }) });
       // The register response used to be thrown away, so a refusal here surfaced
@@ -1572,6 +1645,9 @@ export class Hub {
       // re-open the check. Deliberately NOT noteRaccoonWall(): a stale sn is one
       // attempt failing, not the service-wide wall, and pausing every
       // registration for 10 minutes over it would be a much bigger outage.
+      // Raccoon rotates the session on every response; keep the newest one so the
+      // login call that follows registers in the same session it was created in.
+      this.captureRaccoonSession(sn, regRes);
       const regRejected = this.raccoonRejectedMail(await regRes.json().catch(() => null));
       if (regRejected) {
         const wall = this.isRaccoonWall(regRejected);
@@ -1584,6 +1660,7 @@ export class Hub {
         }, 400);
       }
       const loginRes = await this.raccoonFetch("/users/emailLogin", { method: "POST", headers, body: new URLSearchParams({ email, password, ...base }) });
+      this.captureRaccoonSession(sn, loginRes);
       const loginData = await parseJsonResponse(loginRes, "Raccoon login");
       if (loginData.status !== 200) {
         // Report what Raccoon actually said. "Login failed" hid every reason —
