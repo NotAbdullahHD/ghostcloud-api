@@ -343,6 +343,19 @@ expired. Please refresh it.`
   for genuine congestion. Retrying cannot pass the wall, so "please try again in a
   moment" would be a lie that also spends quota; the outage wording names the one
   screen that does work.
+- **Never lets the refusal be the last word.** Raccoon's sentence — `Please
+  complete the puzzle verification.` — used to reach the player verbatim, telling
+  them to complete a check that was never on screen. There was no way out of
+  that state. Now every path that needs the check says *needVerification*: the
+  `sendEmail` response, the `manualRegister` response, and the session error
+  event. Anything mentioning the check is classified as the check, whatever the
+  wording — including against an older site that never sends the flag. The site
+  uses it to open the account screen, name the two buttons that matter and
+  highlight the first one.
+- **Reports its own build.** `GET /cloud/v1/capabilities` →
+  `{apiVersion, capabilities: {puzzle, manualRegister, seedPool,
+  verificationEvents}}`. The account screen asks for it and prints the result, so
+  a stale deploy is visible instead of being indistinguishable from a bug.
 
 Measured end-to-end in workerd (`node .freebuff/test_wall_live.js`): attempt 1
 ~2.3s and records `raccoonWallCooldownSeconds: 600`; attempt 2 answers in **0.1s**
@@ -366,8 +379,39 @@ makes, and the widget math was read off their file rather than guessed, but trea
 it as verified-by-construction until someone solves one.
 
 To confirm it in 30 seconds: open the site → Settings → Account → **Get temp
-mailbox** → **Solve check & continue** → drag the piece into the gap. A working
-run ends with `✓ Account created and shared` and `diagMail` showing `pool 1/6`.
+mailbox** → **Send code** → drag the piece into the gap → **Register & save**. A
+working run ends with `✓ Account created and shared` and `diagMail` showing
+`pool 1/6`.
+
+The check only exists inside that step. It is requested by *Send code* and it is
+bound to the mailbox in the field above it, so there is nothing to see on the
+account screen before you press it — which is exactly why the site now opens this
+screen and highlights that button whenever the game service refuses for want of
+the check.
+
+## "I redeployed and nothing changed"
+
+The most common cause is that the new build is not the one being served — an edge
+cache holding `js/app.js?v=N`, or an upload that landed somewhere else. Nothing
+about the old and new builds looks different from the outside, so check instead
+of guessing:
+
+1. **The site says it out loud.** Settings → Account prints either
+   `✓ API build <version> — the human check is available.` or the actual reason
+   it failed (unreachable, 401 key, 403 origin, or an older API). The **Check API
+   build** button re-runs it on demand. `node .freebuff/test_puzzle_relay.js`
+   asserts the same endpoint.
+2. **Bump the site's asset version.** `js/app.js?v=…` in `index.html` is part of
+   the URL, so a browser that already has `?v=9` will keep serving it from cache
+   even after the file is replaced. Change the number whenever `app.js` or
+   `style.css` changes.
+3. **A 403 here is the origin allowlist, not a stale build.** `src/sites.js`
+   lists the allowed origins; add the address you are actually loading the site
+   from (an origin the list does not name answers `403 Origin not allowed`, which
+   looks exactly like "the check is missing").
+4. **Confirm the endpoints exist**: `curl -s <api>/cloud/v1/capabilities -H
+   "x-api-key: <your key>"`. A 404 means the Worker being served predates the
+   human-check work.
 
 **Paths forward** (this needs a decision, not a patch):
 
