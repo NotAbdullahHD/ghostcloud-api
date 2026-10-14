@@ -354,8 +354,9 @@ expired. Please refresh it.`
   highlight the first one.
 - **Reports its own build.** `GET /cloud/v1/capabilities` →
   `{apiVersion, capabilities: {puzzle, manualRegister, seedPool,
-  verificationEvents}}`. The account screen asks for it and prints the result, so
-  a stale deploy is visible instead of being indistinguishable from a bug.
+  verificationEvents, codeRefusals}}`. The account screen asks for it and prints
+  the result, so a stale deploy is visible instead of being indistinguishable from
+  a bug.
 
 Measured end-to-end in workerd (`node .freebuff/test_wall_live.js`): attempt 1
 ~2.3s and records `raccoonWallCooldownSeconds: 600`; attempt 2 answers in **0.1s**
@@ -408,8 +409,8 @@ the site's *Send code* step is what starts that clock.
 To see the working half in 30 seconds: open the site → Settings → Account → **Get
 temp mailbox** → **Send code** → drag the piece into the gap. The puzzle clears
 and the code goes out (that is the part this document's fix repairs). **Register &
-save** is the step Raccoon currently refuses for everyone — see the blocker
-section above before treating that failure as a bug in this Worker.
+save** then needs a code that actually arrived in the mailbox — see the gate
+section below for what Raccoon answers and why.
 
 The check only exists inside that step. It is requested by *Send code* and it is
 bound to the mailbox in the field above it, so there is nothing to see on the
@@ -417,48 +418,59 @@ account screen before you press it — which is exactly why the site now opens t
 screen and highlights that button whenever the game service refuses for want of
 the check.
 
-### Known blocker: Raccoon refuses `emailRegister` itself
+### The register gate moved (2026-10-14)
 
-As of this writing, **account creation is refused by Raccoon** — with a freshly
-verified `sn`, in the same session:
+For a while `emailRegister` refused *every* account — Raccoon's own website
+included, for their own users — with:
 
 ```
-verify(offset, fresh)  → {"status":200}          # accepted
-sendEmail(same sn)     → {"status":200,"msg":"success"}   # accepted, code requested
-emailRegister(same sn) → {"status":400,
+emailRegister → {"status":400,
   "msg":"Human verification is required. Please request a new email code."}
 ```
 
-That was 1.3s after `sendEmail` accepted the verification, so it is not latency
-and not a stale check. `verify` alone is not enough either, and re-verifying the
-same challenge is refused (`The puzzle has expired` — challenges are single-use).
-The error is returned *before* the code is looked at, so a bogus code and a real
-one get the same answer.
+**They have since changed it, and it is worth understanding exactly how**, because
+the old answer and the new one look alike and mean opposite things. Probed
+directly against `www.raccoongame.com` on 2026-10-14
+(`node .freebuff/probe_site_2026.js`):
 
-The decisive detail: **Raccoon's own website fails identically.** A player
-registering at raccoongame.com, solving the puzzle, receiving the code and
-submitting it gets this exact sentence — five times running, with five fresh
-codes. Their client sends the same fields we do, in the same order. So the
-verification is accepted for `sendEmail` and not for `emailRegister` on their
-side, for everyone, including their own users.
+| call | answer |
+|---|---|
+| `emailRegister`, never-solved `sn`, bogus code | `415 Verification code has expired or is incorrect` |
+| `emailRegister`, unsolved `sn` **plus its session**, bogus code | same — the session changes nothing |
+| `emailRegister`, an undeliverable domain | `400 The email domain cannot receive email.` |
+| `sendEmail`, fresh `sn`, unverified | `400 Please complete the puzzle verification.` |
 
-The most likely reading is that `sendEmail` spends the verification and
-`emailRegister` wants its own, which their client never re-does. If that is right,
-the client-side fix is: when `~/cloud/v1/manualRegister` answers
-`needVerification`, re-run the puzzle and retry the register — the site already
-receives that flag. It is **not** implemented as an automatic retry, because the
-one supporting test (a fresh `verify` immediately before `register`, with no
-`sendEmail` in between) was also refused; burning an extra human solve on a guess
-would be worse than saying so.
+The gate is **gone from register**. A bad code is now refused on its own merits,
+with no mention of the puzzle, whether or not the check was ever solved — so the
+old diagnosis was right, and `sendEmail` keeps the check while `emailRegister`
+stopped asking for one. **The register step no longer needs the puzzle at all.**
+Only `sendEmail` does, and it is the one that starts the challenge clock.
 
-What the site does instead: it keeps the code the player typed, says the refusal
-came from the game service, and points at the check — so a retry is one click
-rather than five codes.
+That changes three things in this Worker, all of them bugs once the wording
+changed:
 
-Also note: availability of **Sign in with Google** appeared at the same time,
-gated to three hard-coded device ids in Raccoon's page. If registration stays
-refused, an official login method is the honest way forward rather than more
-puzzle work.
+1. **A bad code is not the bot wall.** `"Verification code has expired or is
+   incorrect"` contains *verification*, so it matched the wall pattern. One stale
+   code from one temp-mail lane therefore started the ten-minute service-wide
+   cooldown — a self-inflicted outage from a routine event. `raccoonCodeRejected()`
+   now claims it first, and `isRaccoonWall()` excludes it.
+2. **A bad code asks for another code, not another solve.** `manualRegister`
+   answers `needCode: true` and passes Raccoon's own sentence through, and the
+   site keeps both the typed code and the `sn` and points at *Send code*. Sending
+   the player back to the puzzle would spend a human solve on a step that is
+   already done and cannot fix the code.
+3. **The pool loop spends one more code.** On a code refusal it calls `sendEmail`
+   again, polls for a fresh code and retries `emailRegister` once, then moves on —
+   instead of pausing every registration for ten minutes.
+
+Also new: `/login.html` and `/index.html` are **404** now — the pages moved to
+`/login` and `/home.html`. Anything pointing at the old paths is dead. Sign in
+with Google appeared alongside these changes; Raccoon's page still gated it to
+three hard-coded device ids, so it was not yet a general path.
+
+The API version for this is **2.4.0**, and `capabilities.codeRefusals` says the
+running Worker distinguishes a code refusal from the check. An account screen
+showing anything older is a stale deploy — that is the one thing to check first.
 
 ## "I redeployed and nothing changed"
 

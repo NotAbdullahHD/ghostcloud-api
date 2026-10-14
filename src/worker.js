@@ -30,10 +30,18 @@ const RACCOON_TIMEOUT_MS = 20000;
 // deploy used to be indistinguishable from a code bug, which is exactly how
 // "I updated the API but nothing changed" happens. The website checks this
 // string and says so out loud instead of pretending.
-const API_VERSION = "2.2.0";
+// 2.4.0 — reads Raccoon's post-2026-10-14 register gate correctly: register no
+// longer asks for the puzzle at all, only the *code*, so a bad code is retried
+// with a fresh one instead of being mistaken for the bot wall (which paused
+// every registration for ten minutes) or for a stale human check.
+// 2.3.0 — carries Raccoon's puzzle session cookie (challenge → verify →
+// sendEmail → register → login). Before this, every solve answered "The puzzle
+// has expired" and no account could be created at all, so the account screen
+// printing 2.3.0 is how you confirm the fix is the build actually being served.
+const API_VERSION = "2.4.0";
 // Capabilities the site probes for. Anything missing means the running Worker is
 // an older build than the site expects.
-const API_CAPABILITIES = { puzzle: true, manualRegister: true, seedPool: true, verificationEvents: true };
+const API_CAPABILITIES = { puzzle: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true };
 // Raccoon's registration endpoints sit behind nginx and answer a bare fetch UA
 // with the same puzzle refusal they answer a browser with, so this is not a
 // disguise — it is just the UA the mobile client and the site both send.
@@ -508,7 +516,7 @@ export class Hub {
   }
 
   // ══ Mail lanes ══════════════════════════════════════════════════════════
-  isTempBlockedMessage(msg) { return /temporary email|not supported|disposable/i.test(String(msg || "")); }
+  isTempBlockedMessage(msg) { return /temporary email|not supported|disposable|cannot receive email/i.test(String(msg || "")); }
   // Raccoon's anti-bot wall. Unlike "this domain is a disposable mailbox", this
   // is not about the address: it refuses every address, including a real one, so
   // rotating domains or retrying the same lane cannot get past it. Walking the
@@ -528,7 +536,25 @@ export class Hub {
   isRaccoonWall(msg) {
     const m = String(msg || "");
     if (/no verification code|verification code from/i.test(m)) return false;
+    // "Verification code has expired or is incorrect" contains "verification"
+    // and is NOT the check — it is the code. See raccoonCodeRejected().
+    if (this.raccoonCodeRejected(m)) return false;
     return /puzzle|captcha|human|robot|slide|verification|too frequent/i.test(m);
+  }
+  // The *code*, not the check, and not the address. Raccoon changed this on
+  // 2026-10-14: `/users/emailRegister` no longer asks for the puzzle at all (it
+  // answers a bad code with `415 "Verification code has expired or is
+  // incorrect"`, whether or not the sn was ever solved), and only `sendEmail`
+  // still wants it (`400 "Please complete the puzzle verification."`).
+  //
+  // That matters twice over. One, the sentence contains "verification", so
+  // without this it was read as the wall — a single stale code from one temp-mail
+  // lane started a ten-minute service-wide cooldown. Two, the player was told to
+  // solve the check again, which cannot help: the fix is another code.
+  raccoonCodeRejected(msg) {
+    const m = String(msg || "");
+    if (!/\bcode\b/i.test(m)) return false;
+    return /expir|incorrect|invalid|wrong|mismatch|used/i.test(m);
   }
   // Remember the wall and stop attempting registrations for a cooldown. The
   // wall refuses every address, so a retry cannot change the answer — it only
@@ -811,11 +837,28 @@ export class Hub {
             console.log(`lane ${lane.id} failed (pass ${pass + 1}): ${lastErr.message}`);
             continue;
           }
-          const regRes = await this.raccoonFetch("/users/emailRegister", {
-            method: "POST", headers: h,
-            body: new URLSearchParams({ email, code, password: raccoonPassword, phone: "1", country: "Brazil", ...common }),
-          });
-          const regRejected = this.raccoonRejectedMail(await regRes.json().catch(() => null));
+          // A code complaint gets one fresh code, not a new human check and not
+          // a cooldown: the address is fine and the verification is spent, but the
+          // *code* was stale — usually a temp-mail lane reading an old message.
+          let regRejected = null;
+          let codeRounds = 0;
+          while (codeRounds < 2) {
+            const regRes = await this.raccoonFetch("/users/emailRegister", {
+              method: "POST", headers: h,
+              body: new URLSearchParams({ email, code, password: raccoonPassword, phone: "1", country: "Brazil", ...common }),
+            });
+            regRejected = this.raccoonRejectedMail(await regRes.json().catch(() => null));
+            if (!regRejected || !this.raccoonCodeRejected(regRejected) || ++codeRounds >= 2) break;
+            const again = await this.raccoonFetch("/users/sendEmail", {
+              method: "POST", headers: h,
+              body: new URLSearchParams({ email, type: "register", ...common }),
+            });
+            const againRejected = this.raccoonRejectedMail(await again.json().catch(() => null));
+            if (againRejected) { regRejected = againRejected; break; }
+            const fresh = await this.pollCode(lane, handle, 12);
+            if (!fresh) break; // keep the code refusal — the lane is the problem
+            code = fresh;
+          }
           if (regRejected) {
             if (this.isRaccoonWall(regRejected)) {
               hardStop = Object.assign(new Error(`Raccoon is gating registration behind a bot check: ${regRejected}`), { busy: true, raccoonWall: true });
@@ -1651,11 +1694,17 @@ export class Hub {
       const regRejected = this.raccoonRejectedMail(await regRes.json().catch(() => null));
       if (regRejected) {
         const wall = this.isRaccoonWall(regRejected);
-        console.log(`manualRegister refused for ${email}: ${regRejected}`);
+        // The code, not the check. Since 2026-10-14 Raccoon's register no longer
+        // asks for the puzzle, so a code complaint is answered with a *new code*
+        // — sending the player back to the puzzle would spend another human
+        // solve on a step that is already done, and it cannot fix the code.
+        const codeBad = !wall && this.raccoonCodeRejected(regRejected);
+        console.log(`manualRegister refused for ${email} (${codeBad ? "code" : wall ? "check" : "other"}): ${regRejected}`);
         return json({
           error: wall ? "The human check went stale before the account was made — solve it again and the code comes with it." : regRejected,
           raccoon: regRejected,
           needVerification: wall,
+          needCode: codeBad,
           retry_after_seconds: null,
         }, 400);
       }
