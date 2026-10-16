@@ -472,6 +472,80 @@ The API version for this is **2.4.0**, and `capabilities.codeRefusals` says the
 running Worker distinguishes a code refusal from the check. An account screen
 showing anything older is a stale deploy — that is the one thing to check first.
 
+## "Temporary email addresses are not supported." — a refused mailbox
+
+This one reached players as red text on the account form (reported in Discord,
+16 Oct 2026). It is Raccoon refusing the *address*, not the check: the free mail
+providers hand out domains it treats as disposable, and nothing the player does
+changes that.
+
+It used to be expensive as well as ugly. The mailbox was created first, the
+player solved the slider, and only then did `sendEmail` answer with that sentence
+— one human drag spent on an address nobody had chosen, ending in an error that
+read as the site being broken.
+
+**Measured 2026-10-16, and this is the part that makes a fix possible:**
+`/users/emailRegister` answers the *domain* question before it looks at the code,
+and needs no puzzle, no session and no human. Probed directly against
+`www.raccoongame.com` (see `.freebuff/test_mailbox_screen.js` for the shapes):
+
+| call | answer |
+|---|---|
+| `emailRegister`, blocked domain, junk code, no session | `400 Temporary email addresses are not supported.` |
+| `emailRegister`, reachable domain, junk code | `415 Verification code has expired or is incorrect` — i.e. a *code* complaint, so the domain passed |
+| `sendEmail`, blocked domain, unverified | `400 Please complete the puzzle verification.` — the puzzle is checked **first**, so `sendEmail` cannot screen a domain |
+
+So one cheap call settles a domain before any player sees a slider.
+
+**What the Worker does now (2.5.0):**
+
+1. `screenMailDomain(email)` — every mailbox is screened before it is handed out
+   (both in `createMailbox` and in the pool-fill loop, where it also saves a
+   `sendEmail` plus ~50s of polling on mail that was never going to arrive). A
+   refused domain goes on the persisted blocklist and the next one is used.
+2. A domain that passes is remembered for six hours, so the question is asked
+   once per domain rather than once per player. A domain that is refused later —
+   by `sendEmail` or by `emailRegister` — is moved to the blocklist immediately.
+3. `needMailbox: true` on a `sendEmail`/`manualRegister` refusal, so the site can
+   take another mailbox instead of printing Raccoon's sentence. If every domain is
+   refused, `createMailbox` answers `needOwnAccount` with a plain, actionable
+   sentence and no provider name, domain name or HTTP code.
+4. A screen that could not be run blocks nothing: it proves nothing, and the real
+   refusal still catches the mailbox later.
+
+`capabilities.mailDomainScreen` says the running Worker has this. The site side
+(`app.js` 2.5.0-era) needs no matching flag: it already falls back to matching the
+wording, so an older API that only forwards Raccoon's sentence still takes a fresh
+mailbox instead of showing it.
+
+**What it does not fix.** The screen cannot make a domain acceptable — it only
+stops one reaching a player, and the pool of free domains Raccoon has already
+blocked keeps growing (`diagMail` → `blockedDomains`). The durable answer is still
+the own-domain lane (`GHOSTCLOUD_MAIL_DOMAIN` + `GHOSTCLOUD_INBOUND_KEY`), which
+does not depend on anyone else's domains at all.
+
+## "Try again in X seconds" — the check's own rate limit
+
+Raccoon rate-limits puzzle attempts per window (`429 Too many puzzle attempts`,
+see `puzzleRetryAfter()`). The server was already reporting it as
+`retry_after_seconds`, but the modal printed a sentence about clicking a button
+and left its own `busy` flag set — so the slider ignored every gesture, **New
+puzzle did nothing at all**, and the only way out was Cancel. Reported live as
+"after that when we click new puzzle nothing happens".
+
+The fix is entirely in `stratus/js/app.js` (site only — no API change):
+
+- every early return in `loadPuzzle`/`verifyPuzzle` now clears the busy flag, so
+  no path can leave the modal dead;
+- a rate limit starts a real countdown (`Try again in Ns`), with the slider and
+  the button disabled while it runs, and one automatic re-request when it ends;
+- the wait is a *deadline*, not a timer, and it is also re-checked when the tab
+  becomes visible or the modal is touched — a backgrounded tab is throttled to
+  about a timer a second and can be frozen outright (found by testing in a tab
+  that was never composited: the countdown sat unfired 80s past its deadline).
+
+`node .freebuff/test_puzzle_cooldown.js` covers all of it in a stub DOM.
+
 ## "I redeployed and nothing changed"
 
 The most common cause is that the new build is not the one being served — an edge

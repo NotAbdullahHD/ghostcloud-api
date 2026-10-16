@@ -25,6 +25,12 @@ import SITES from "./sites.js";
 
 const RACCOON_HOST = "www.raccoongame.com";
 const RACCOON_TIMEOUT_MS = 20000;
+// How long a mail domain that passed the screen is trusted for. Raccoon
+// blocklists new disposable domains over time, so "passed once" is not forever —
+// but re-asking for every mailbox would spend a registration attempt per player
+// on a question whose answer changes weekly. A domain that is refused later is
+// caught by the sendEmail/register paths, which mark it blocked immediately.
+const MAIL_DOMAIN_SCREEN_TTL_MS = 6 * 60 * 60 * 1000;
 // Bumped whenever the HTTP contract changes shape, and reported by
 // /cloud/v1/capabilities. The site asks for it on the account screen: a stale
 // deploy used to be indistinguishable from a code bug, which is exactly how
@@ -38,10 +44,10 @@ const RACCOON_TIMEOUT_MS = 20000;
 // sendEmail → register → login). Before this, every solve answered "The puzzle
 // has expired" and no account could be created at all, so the account screen
 // printing 2.3.0 is how you confirm the fix is the build actually being served.
-const API_VERSION = "2.4.0";
+const API_VERSION = "2.5.0";
 // Capabilities the site probes for. Anything missing means the running Worker is
 // an older build than the site expects.
-const API_CAPABILITIES = { puzzle: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true };
+const API_CAPABILITIES = { puzzle: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true };
 // Raccoon's registration endpoints sit behind nginx and answer a bare fetch UA
 // with the same puzzle refusal they answer a browser with, so this is not a
 // disguise — it is just the UA the mobile client and the site both send.
@@ -177,11 +183,22 @@ const BUSY_MESSAGE = "We're at our busiest right now and couldn't set up your ga
 // lie that also spends quota. Say what is actually true and point at the path
 // that does work — a player's own account skips registration entirely.
 const OUTAGE_MESSAGE = "The game service now asks for a quick human check before it opens an account: one slider puzzle, solved once. Open your account settings, get a mailbox and solve it — after that your games start normally, and so do everyone else's.";
+// Shown when Raccoon refuses the *address* rather than the human check: it
+// treats the free mail providers' domains as disposable, and no amount of
+// retrying, re-solving or waiting changes that. Naming the provider or quoting
+// Raccoon's own sentence ("Temporary email addresses are not supported.") sends
+// players to report a bug about an address they never chose, so the message says
+// what is true and points at the path that works: their own account.
+const MAIL_REFUSED_MESSAGE = "The game service is refusing the free mail providers this site uses, so a new account cannot be made right now. If you have your own account for the game, add it in Settings and your games start normally.";
 function playerMessage(e) {
   if (e && e.raccoonWall) return OUTAGE_MESSAGE;
   if (e && e.busy) return BUSY_MESSAGE;
   const m = String((e && e.message) || "");
-  if (/at capacity|rate limit|heavy load|briefly unavailable|invalid response|no response|no verification code|No mail domains|blocklisted by Raccoon|Raccoon refused/i.test(m)) {
+  // "Raccoon refuse(s|d) <domain> as a temporary address" is our own wording for
+  // a domain the screen retired. Without it a player would read the domain name
+  // and Raccoon's name in their error line, which is exactly the leak this whole
+  // function exists to stop.
+  if (/at capacity|rate limit|heavy load|briefly unavailable|invalid response|no response|no verification code|No mail domains|blocklisted by Raccoon|Raccoon refuse|temporary address/i.test(m)) {
     return BUSY_MESSAGE;
   }
   return m;
@@ -302,6 +319,9 @@ export class Hub {
     this.proAttempts = new Map();
     this.inboundCodes = new Map();
     this.blockedMailDomains = new Set();
+    // Domains the *screen* below has passed, with when. In memory only: it is a
+    // cache of a cheap check, and a fresh Durable Object simply re-asks.
+    this.screenedMailDomains = new Map();
     this.providerHealth = new Map();
     this.providerStats = new Map();
     this.lastQueueBroadcastAt = 0;
@@ -591,8 +611,57 @@ export class Hub {
     const dom = String(email || "").split("@")[1];
     if (!dom || !this.isTempBlockedMessage(why) || this.blockedMailDomains.has(dom)) return;
     this.blockedMailDomains.add(dom);
+    this.screenedMailDomains.delete(dom);
     console.log(`mail domain rejected by Raccoon (${String(why).trim()}) — ${dom} added to blocklist`);
     this.state.waitUntil(this.storage.put("blockedDomains", [...this.blockedMailDomains]).catch(() => {}));
+  }
+  // Is this address's domain one Raccoon will actually accept?
+  //
+  // A domain it refuses costs a player a whole solved puzzle and then reads as the
+  // site being broken ("Temporary email addresses are not supported." — the red
+  // text in the bug report). So the mailbox is screened before it is ever handed
+  // out.
+  //
+  // Measured 2026-10-16, against Raccoon directly: `/users/emailRegister` answers
+  // the *domain* question before it looks at the code, and needs no puzzle and no
+  // session — a blocked domain with a junk code answers "Temporary email addresses
+  // are not supported.", a reachable domain answers the same junk code with a
+  // code complaint. So one cheap call settles it, with no human involved.
+  //
+  // A domain that passes is remembered for MAIL_DOMAIN_SCREEN_TTL_MS, so this is
+  // asked once per domain per TTL rather than once per player; a domain that fails
+  // goes on the permanent blocklist above. A screen that could not be run proves
+  // nothing, so it lets the mailbox through — the sendEmail path still catches it.
+  async screenMailDomain(email) {
+    const dom = String(email || "").split("@")[1];
+    if (!dom) return true;
+    if (this.blockedMailDomains.has(dom)) return false;
+    const passedAt = this.screenedMailDomains.get(dom);
+    if (passedAt && Date.now() - passedAt < MAIL_DOMAIN_SCREEN_TTL_MS) return true;
+    try {
+      const r = await this.raccoonFetch("/users/emailRegister", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": BROWSER_UA },
+        body: new URLSearchParams({
+          email, code: "000000", password: generatePassword(), phone: "1", country: "Brazil",
+          sn: generateSN(), model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0",
+          device_name: "GhostCloud", os: "web",
+        }),
+      });
+      const msg = this.raccoonRejectedMail(await r.json().catch(() => null));
+      if (!msg) return true;
+      if (this.isTempBlockedMessage(msg)) {
+        this.markDomainBlocked(email, msg);
+        console.log(`domain screen: ${dom} refused by Raccoon (${msg}) — will not be handed out`);
+        return false;
+      }
+      // Any other refusal is about the code, which means the domain is fine.
+      this.screenedMailDomains.set(dom, Date.now());
+      return true;
+    } catch (e) {
+      console.log(`domain screen for ${dom} could not run: ${e.message}`);
+      return true;
+    }
   }
   raccoonRejectedMail(data) {
     if (!data || typeof data !== "object") return null;
@@ -804,6 +873,14 @@ export class Hub {
         try {
           const { email, handle } = await lane.create();
           if (this.blockedMailDomains.has(String(email).split("@")[1])) continue;
+          // One cheap call before the expensive part: a domain Raccoon refuses
+          // would otherwise burn a sendEmail and ~50s of polling on mail that was
+          // never going to be accepted.
+          if (!(await this.screenMailDomain(email))) {
+            lastErr = new Error(`Raccoon refuses ${String(email).split("@")[1]} as a temporary address`);
+            console.log(`lane ${lane.id} skipped (pass ${pass + 1}): ${lastErr.message}`);
+            continue;
+          }
           const raccoonPassword = generatePassword();
           const sn = generateSN();
           const h = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0 Chrome/147.0.0.0 Safari/537.36" };
@@ -1521,11 +1598,25 @@ export class Hub {
   // ══ Mail endpoints ══════════════════════════════════════════════════════
   async handleCreateMailbox() {
     let lastErr = null;
-    for (const lane of this.laneOrder()) {
-      try { const { email, handle } = await lane.create(); return json({ email, ...handle }); }
-      catch (e) { lastErr = e; this.noteProviderFail(lane.id, e); }
+    let refusedDomain = false;
+    // Two passes: a lane hands out one of its domains at a time, so a domain the
+    // screen just retired is replaced by the next one the lane owns. Without the
+    // screen a player paid for the refusal with a solved puzzle and then read a
+    // sentence about temporary email addresses on their own screen.
+    for (let pass = 0; pass < 2; pass++) {
+      for (const lane of this.laneOrder()) {
+        try {
+          const { email, handle } = await lane.create();
+          if (!(await this.screenMailDomain(email))) { refusedDomain = true; continue; }
+          return json({ email, ...handle });
+        } catch (e) { lastErr = e; this.noteProviderFail(lane.id, e); }
+      }
     }
-    return json({ error: lastErr ? lastErr.message : "No mail provider available" }, 500);
+    // Every usable domain is refused: that is a known, actionable situation, not
+    // "we are busy" — so it says so instead of quoting a provider or Raccoon.
+    if (!lastErr) return json({ error: MAIL_REFUSED_MESSAGE, needOwnAccount: true }, refusedDomain ? 503 : 500);
+    if (refusedDomain) console.log(`createMailbox: at least one domain was refused (last error: ${lastErr.message})`);
+    return json({ error: playerMessage(lastErr) }, 500);
   }
   async handleGetCode(ctx) {
     const body = ctx.body || {};
@@ -1642,12 +1733,20 @@ export class Hub {
       const data = await r.json().catch(() => ({}));
       console.log(`sendEmail ${email} → HTTP ${r.status} ${JSON.stringify(data)}`);
       if (data.status && data.status !== 200) {
+        const msg = data.msg || `Raccoon rejected: ${JSON.stringify(data)}`;
+        // The refusal is about the *address*, not the check: Raccoon treats the
+        // free providers' domains as disposable. Reported as its own case so the
+        // site can take another mailbox instead of printing this at the player,
+        // and remembered so no later player is handed the same domain.
+        const tempBlocked = this.isTempBlockedMessage(msg);
+        if (tempBlocked) this.markDomainBlocked(email, msg);
         return json({
-          error: data.msg || `Raccoon rejected: ${JSON.stringify(data)}`,
+          error: tempBlocked ? MAIL_REFUSED_MESSAGE : msg,
           raccoon: data,
+          needMailbox: tempBlocked,
           // Tells the site to open the puzzle instead of showing an error: the
           // refusal is a human check, not a broken state.
-          needVerification: this.isRaccoonWall(data.msg),
+          needVerification: !tempBlocked && this.isRaccoonWall(msg),
           retry_after_seconds: this.puzzleRetryAfter(data),
         }, 400);
       }
@@ -1693,16 +1792,25 @@ export class Hub {
       this.captureRaccoonSession(sn, regRes);
       const regRejected = this.raccoonRejectedMail(await regRes.json().catch(() => null));
       if (regRejected) {
-        const wall = this.isRaccoonWall(regRejected);
+        // A refused address first: Raccoon says "Temporary email addresses are
+        // not supported." for a whole domain, which is nothing the player did and
+        // nothing the check can fix — so it rotates on the site instead of being
+        // forwarded as their error.
+        const tempBlocked = this.isTempBlockedMessage(regRejected);
+        if (tempBlocked) this.markDomainBlocked(email, regRejected);
+        const wall = !tempBlocked && this.isRaccoonWall(regRejected);
         // The code, not the check. Since 2026-10-14 Raccoon's register no longer
         // asks for the puzzle, so a code complaint is answered with a *new code*
         // — sending the player back to the puzzle would spend another human
         // solve on a step that is already done, and it cannot fix the code.
-        const codeBad = !wall && this.raccoonCodeRejected(regRejected);
-        console.log(`manualRegister refused for ${email} (${codeBad ? "code" : wall ? "check" : "other"}): ${regRejected}`);
+        const codeBad = !wall && !tempBlocked && this.raccoonCodeRejected(regRejected);
+        console.log(`manualRegister refused for ${email} (${tempBlocked ? "mailbox" : codeBad ? "code" : wall ? "check" : "other"}): ${regRejected}`);
         return json({
-          error: wall ? "The human check went stale before the account was made — solve it again and the code comes with it." : regRejected,
+          error: tempBlocked ? MAIL_REFUSED_MESSAGE
+            : wall ? "The human check went stale before the account was made — solve it again and the code comes with it."
+            : regRejected,
           raccoon: regRejected,
+          needMailbox: tempBlocked,
           needVerification: wall,
           needCode: codeBad,
           retry_after_seconds: null,
