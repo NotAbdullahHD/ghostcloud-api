@@ -63,10 +63,15 @@ const MAIL_DOMAIN_SCREEN_TTL_MS = 6 * 60 * 60 * 1000;
 // this Worker's IP, so an exhausted budget is a site-wide outage (measured:
 // five asks, then "Too many puzzle attempts. Please try again in 3543
 // seconds.", and the cooldown grows with every further ask).
-const API_VERSION = "2.7.0";
+// 2.8.0 — when the pool is empty and Raccoon's gate is up, the API offers one
+// deliberate way back instead of a dead end: a single opt-in human check that
+// creates one shared account. Raccoon re-gated `sendEmail` behind the check on
+// 2026-10-20 (confirmed from a clean IP, so not an IP flag), which means the
+// automatic path cannot create an account at all until the gate lifts.
+const API_VERSION = "2.8.0";
 // Capabilities the site probes for. Anything missing means the running Worker is
 // an older build than the site expects.
-const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true };
+const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, optInUnlock: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true };
 // How many *new* challenges this Worker will ask Raccoon for in a window. Kept
 // well below the observed limit on purpose: a refusal locks the check out for
 // everyone for an hour, and a challenge reused or remembered costs nothing.
@@ -809,6 +814,12 @@ export class Hub {
       out.capacity = true;
       const left = Math.ceil(Math.max(0, this.raccoonWalledUntil - Date.now()) / 1000);
       if (left > 0) out.retry_after_seconds = left;
+      // The one legitimate way out. `canUnlock` is an *offer*, never an action:
+      // the site shows a button, the player chooses, and the drag happens in
+      // their own browser. Without it an empty pool is a dead end; with it, one
+      // person's check creates an account that every player after them reuses.
+      out.canUnlock = this.puzzleAvailable();
+      if (out.canUnlock) out.error = `${out.error} You can also bring free play back yourself \u2014 one quick check, and the account it creates is shared with everyone.`;
     }
     return out;
   }
@@ -1991,6 +2002,15 @@ export class Hub {
   // remembered lockout that survives eviction, and one shape for the answer so
   // the site always shows a wait instead of a slider that cannot pass.
   puzzleBlockRemaining() { return Math.max(0, Math.ceil((this.puzzleBlockedUntil - Date.now()) / 1000)); }
+  // Can a player's opt-in drag actually get through right now? Both gates have
+  // to be open: Raccoon must not have told us to stop, and our own window must
+  // have room. Offering the button when either is shut would be the 43-minute
+  // dead end again, only with an extra click in front of it.
+  puzzleAvailable() {
+    if (this.puzzleBlockRemaining() > 0) return false;
+    const now = Date.now();
+    return this.puzzleIssueTimes.filter((t) => t > now - PUZZLE_ISSUE_WINDOW_MS).length < PUZZLE_ISSUE_MAX;
+  }
   notePuzzleBlocked(seconds, why) {
     const secs = Math.min(PUZZLE_BLOCK_MAX_MS / 1000, Math.max(30, Number(seconds) || 0));
     const until = Date.now() + secs * 1000;

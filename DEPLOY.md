@@ -617,6 +617,39 @@ Also in 2.7.0:
 escalate, it survives eviction, the budget caps a rush at six, and an `auto`
 wall never produces a verification hint.
 
+**2.8.0 — one deliberate way back instead of a dead end.**
+On 2026-10-20 Raccoon re-gated registration itself: `sendEmail` answers
+`Please complete the puzzle verification.` for every address, **from a clean
+IP as well** (verified from this machine, not just from Cloudflare), and
+`emailRegister` answers `Temporary email addresses are not supported.` for every
+domain the free providers hand out. So the automatic fill path cannot create an
+account at all while that gate is up, and an empty pool stays empty. Waiting is
+not a fix: the 10-minute wall cooldown just retries into the same refusal.
+
+What the API does about it:
+
+- `sessionErrorEvent` adds **`canUnlock: true`** when an automatic account
+  failure could actually be cleared — Raccoon is not in a lockout *and* the local
+  challenge budget has room (`puzzleAvailable()`). The error sentence says the
+  account would be shared, so the choice is informed.
+- It is an *offer*: `needVerification` stays `false`, so no site opens a slider by
+  itself. The site shows a button; only a click starts the check. With the
+  lockout set, `canUnlock` is `false` and no button appears at all.
+- One solved check creates one account, and accounts are recycled, so a single
+drag can carry every player after it. That is why the offer exists at all.
+
+Site side (`app.js?v=17`, `style.css?v=12`): the player overlay gains an
+"Unlock free play" button and one explanatory line. `showUnlockOffer()` is the
+only place that reveals it; the click sets `unlockRequested` and re-enters the
+setup loop through `retrySetup` — re-running `playGame()` would re-open the
+player, re-check the daily limit and count the play twice.
+
+Tests: section 8 of `test_inline_provision.js` drives the real `playGame` — no
+slider on Play, the offer visible, no session retry, then a click that runs the
+check, seeds the account and starts the game. Section 11 of
+`test_puzzle_cache.mjs` checks both halves of `canUnlock` (offered when the
+budget allows it, withheld during a lockout).
+
 ## "I redeployed and nothing changed"
 
 The most common cause is that the new build is not the one being served — an edge
