@@ -582,6 +582,41 @@ Tests: `node .freebuff/test_puzzle_cache.mjs` drives the real `Hub` class with a
 stubbed Raccoon and in-memory DO storage (cache, single-flight, eviction,
 classification); `node .freebuff/test_puzzle_cooldown.js` covers the modal.
 
+**2.7.0 — the check is no longer on the Play path, and its budget is ours.**
+The report after 2.6.0 was still `Too many puzzle attempts. Please try again in
+2619 seconds. Try again in 2611s.` — i.e. a 43-minute countdown on a Play
+button. Two separate faults behind it:
+
+1. A player pressing Play could be sent to a slider by an *automatic* account
+   failure. The automatic path never uses the human check (the pool is filled
+   without one), and the refusal is about this Worker's IP allowance, not about
+   the person. So `createAccountRaw` errors now carry `auto: true`,
+   `sessionErrorEvent` drops `needVerification` for them, adds `capacity: true`
+   and a `retry_after_seconds`, and the player reads
+   `NO_ACCOUNT_MESSAGE` — "try again in a few minutes", with nothing to solve.
+   The manual (Settings → account) path keeps its hint, because there a slider
+   really is the next step.
+2. Each retry made the lockout worse. `puzzleBlockedUntil` is now set from any
+   `retry_after_seconds` Raccoon sends (capped at an hour), **persisted**, and
+   nothing asks again until it expires — that is what stops 591s → 3406s →
+   3543s. On top of that, `PUZZLE_ISSUE_MAX` (6 per 15 minutes, site-wide) caps
+   how fast the shared allowance can be spent at all; beyond it the API answers
+   `puzzle_blocked` with a wait and does not call Raccoon.
+
+Also in 2.7.0:
+
+- `/healthz` reports `pool`, `pool_target` and `puzzle_blocked_for_seconds`. A
+  locked check is not an outage (the pool still starts games) so it does not
+  flip the status to degraded — it is there to explain why *registrations*
+  stopped, with the exact remaining time.
+- `doPollQueue` retries once on a 5xx or a dropped connection. One blip on
+  Raccoon's edge used to end the whole session; the call is a read, so asking
+  again is safe.
+
+`test_puzzle_cache.mjs` covers all of it: the lockout is remembered and cannot
+escalate, it survives eviction, the budget caps a rush at six, and an `auto`
+wall never produces a verification hint.
+
 ## "I redeployed and nothing changed"
 
 The most common cause is that the new build is not the one being served — an edge

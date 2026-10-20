@@ -57,10 +57,27 @@ const MAIL_DOMAIN_SCREEN_TTL_MS = 6 * 60 * 60 * 1000;
 // session in storage so a Durable Object eviction cannot fake an expiry, and
 // says *which* kind of refusal came back so the site stops answering a wrong
 // drag with a fresh challenge.
-const API_VERSION = "2.6.0";
+// 2.7.0 — the human check is budgeted by *us*, not by Raccoon, and the automatic
+// account path no longer asks a player to solve one at all. Raccoon limits
+// `emailRegisterCaptcha` per egress IP and every player's challenge comes from
+// this Worker's IP, so an exhausted budget is a site-wide outage (measured:
+// five asks, then "Too many puzzle attempts. Please try again in 3543
+// seconds.", and the cooldown grows with every further ask).
+const API_VERSION = "2.7.0";
 // Capabilities the site probes for. Anything missing means the running Worker is
 // an older build than the site expects.
-const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true };
+const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true };
+// How many *new* challenges this Worker will ask Raccoon for in a window. Kept
+// well below the observed limit on purpose: a refusal locks the check out for
+// everyone for an hour, and a challenge reused or remembered costs nothing.
+// Six per fifteen minutes is more than the site needs (the pool serves play;
+// the slider is only for the Settings account flow), and it cannot run the
+// shared budget dry.
+const PUZZLE_ISSUE_MAX = 6;
+const PUZZLE_ISSUE_WINDOW_MS = 15 * 60 * 1000;
+// A Raccoon lockout is reported in seconds and can be an hour. Cap what we
+// believe so a nonsense number cannot park the check forever.
+const PUZZLE_BLOCK_MAX_MS = 60 * 60 * 1000;
 // A challenge is reusable for this long. Raccoon keeps it in its own session and
 // a human needs only a few seconds, so a player re-opening the check (a double
 // tap, a tab switch, a retry after a wrong drag) must get the challenge that is
@@ -224,6 +241,12 @@ const BUSY_MESSAGE = "We're at our busiest right now and couldn't set up your ga
 // lie that also spends quota. Say what is actually true and point at the path
 // that does work — a player's own account skips registration entirely.
 const OUTAGE_MESSAGE = "The game service now asks for a quick human check before it opens an account: one slider puzzle, solved once. Open your account settings, get a mailbox and solve it — after that your games start normally, and so do everyone else's.";
+// What a player gets when *automatic* account creation is refused. They are not
+// asked to solve anything: the automatic path never uses the human check (the
+// pool is filled without one), and sending them to a slider they cannot pass is
+// what produced a 43-minute countdown on a Play button. Nothing on their side is
+// wrong, so the message says that and points at time, not effort.
+const NO_ACCOUNT_MESSAGE = "Every free slot is busy right now and the game service is not opening new accounts this minute. Nothing is wrong on your side \u2014 try again in a few minutes.";
 // Shown when Raccoon refuses the *address* rather than the human check: it
 // treats the free mail providers' domains as disposable, and no amount of
 // retrying, re-solving or waiting changes that. Naming the provider or quoting
@@ -232,6 +255,9 @@ const OUTAGE_MESSAGE = "The game service now asks for a quick human check before
 // what is true and points at the path that works: their own account.
 const MAIL_REFUSED_MESSAGE = "The game service is refusing the free mail providers this site uses, so a new account cannot be made right now. If you have your own account for the game, add it in Settings and your games start normally.";
 function playerMessage(e) {
+  // Checked before the generic wall wording: an auto-created account that ran
+  // into the wall is a capacity problem, not homework for the player.
+  if (e && e.raccoonWall && e.auto) return NO_ACCOUNT_MESSAGE;
   if (e && e.raccoonWall) return OUTAGE_MESSAGE;
   if (e && e.busy) return BUSY_MESSAGE;
   const m = String((e && e.message) || "");
@@ -381,6 +407,13 @@ export class Hub {
     this.lastPresenceSweepAt = 0;
     this.poolFilling = false;
     this.raccoonWalledUntil = 0;
+    // Challenge issuance is budgeted locally so one busy hour cannot spend the
+    // shared IP's allowance and lock the check out for everybody (see
+    // PUZZLE_ISSUE_MAX). `puzzleBlockedUntil` is Raccoon's own "no" — while it
+    // is set we do not ask at all, which is what stops the cooldown escalating
+    // (591s → 3406s → 3543s in the live reports).
+    this.puzzleIssueTimes = [];
+    this.puzzleBlockedUntil = 0;
 
     // ── durable bits (survive eviction between deploys) ──
     this.ready = state.blockConcurrencyWhile(async () => {
@@ -393,6 +426,10 @@ export class Hub {
         if (Array.isArray(savedBlocked)) this.blockedMailDomains = new Set(savedBlocked);
         const savedWall = await this.storage.get("raccoonWalledUntil");
         if (typeof savedWall === "number" && savedWall > Date.now()) this.raccoonWalledUntil = savedWall;
+        // A lockout must outlive the object too: eviction is not permission to
+        // ask again and push the window out by another hour.
+        const savedPuzzleBlock = await this.storage.get("puzzleBlockedUntil");
+        if (typeof savedPuzzleBlock === "number" && savedPuzzleBlock > Date.now()) this.puzzleBlockedUntil = savedPuzzleBlock;
         // Puzzle sessions and solved checks have to outlive this object. A
         // Durable Object is evicted when it goes quiet, and the gap between a
         // challenge being handed to a human and that human dragging the slider
@@ -544,6 +581,15 @@ export class Hub {
     const body = { status: reason ? "degraded" : "ok", name: "ghostcloud-api", apiVersion: API_VERSION };
     if (reason) body.reason = reason;
     if (wallLeftMs > 0) body.retry_after_seconds = Math.ceil(wallLeftMs / 1000);
+    // The account pool is what decides whether anybody can play, so it is worth
+    // reporting even when the answer is "ok".
+    body.pool = pool;
+    body.pool_target = this.POOL_TARGET;
+    // A locked-out human check is not an outage — play still works from the pool
+    // — but it is the first thing to look at when registrations stop, and it
+    // stops a monitor from rediscovering the same hour-long wait.
+    const puzzleLeft = this.puzzleBlockRemaining();
+    if (puzzleLeft > 0) body.puzzle_blocked_for_seconds = puzzleLeft;
     return { status: reason ? 503 : 200, body };
   }
   // Is this pooled account still able to log in? One authenticated checkCost,
@@ -751,13 +797,27 @@ export class Hub {
   // cannot see any verification": the session error now carries the fact that a
   // check exists, and the site can open it.
   sessionErrorEvent(e) {
-    const wall = !!(e && e.raccoonWall) || this.isRaccoonWall(e && e.message);
-    return { status: "error", error: playerMessage(e), needVerification: wall };
+    // The automatic path can never make use of a human check: the pool is filled
+    // without one, and Raccoon's refusal is about this Worker's IP budget, not
+    // about the person pressing Play. Sending them to a slider produced a
+    // 43-minute countdown on a Play button, so the hint is dropped for these and
+    // the event says "capacity" instead.
+    const auto = !!(e && e.auto);
+    const wall = !auto && ((!!(e && e.raccoonWall)) || this.isRaccoonWall(e && e.message));
+    const out = { status: "error", error: playerMessage(e), needVerification: wall };
+    if (auto) {
+      out.capacity = true;
+      const left = Math.ceil(Math.max(0, this.raccoonWalledUntil - Date.now()) / 1000);
+      if (left > 0) out.retry_after_seconds = left;
+    }
+    return out;
   }
   wallCooldownError() {
     if (Date.now() >= this.raccoonWalledUntil) return null;
     const left = Math.ceil((this.raccoonWalledUntil - Date.now()) / 1000);
-    return Object.assign(new Error(`raccoon registration wall in cooldown (${left}s left)`), { busy: true, raccoonWall: true });
+    // `auto`: this error is from the automatic account path, where the player has
+    // no slider to solve — see sessionErrorEvent.
+    return Object.assign(new Error(`raccoon registration wall in cooldown (${left}s left)`), { busy: true, raccoonWall: true, auto: true });
   }
   markDomainBlocked(email, why) {
     const dom = String(email || "").split("@")[1];
@@ -1078,7 +1138,7 @@ export class Hub {
           }
           if (rejected) {
             if (this.isRaccoonWall(rejected)) {
-              hardStop = Object.assign(new Error(`Raccoon is gating registration behind a bot check: ${rejected}`), { busy: true, raccoonWall: true });
+              hardStop = Object.assign(new Error(`Raccoon is gating registration behind a bot check: ${rejected}`), { busy: true, raccoonWall: true, auto: true });
               this.noteRaccoonWall(rejected);
               break;
             }
@@ -1118,7 +1178,7 @@ export class Hub {
           }
           if (regRejected) {
             if (this.isRaccoonWall(regRejected)) {
-              hardStop = Object.assign(new Error(`Raccoon is gating registration behind a bot check: ${regRejected}`), { busy: true, raccoonWall: true });
+              hardStop = Object.assign(new Error(`Raccoon is gating registration behind a bot check: ${regRejected}`), { busy: true, raccoonWall: true, auto: true });
               this.noteRaccoonWall(regRejected);
               break;
             }
@@ -1138,7 +1198,7 @@ export class Hub {
           this.noteProviderOk(lane.id);
           return { sn, token: userToken };
         } catch (e) {
-          if (this.isRaccoonWall(e.message)) { hardStop = Object.assign(e, { busy: true, raccoonWall: true }); this.noteRaccoonWall(e.message); break; }
+          if (this.isRaccoonWall(e.message)) { hardStop = Object.assign(e, { busy: true, raccoonWall: true, auto: true }); this.noteRaccoonWall(e.message); break; }
           lastErr = e;
           if (e && e.throttled) throttledLanes.add(lane.id);
           // Logged per lane, as it happens. The old code only logged `lastErr`
@@ -1279,10 +1339,22 @@ export class Hub {
   }
   async doPollQueue(session, queue_id) {
     const { sn, token } = session;
-    const d = await parseJsonResponse(await this.raccoonFetch("/jyapi/playQueue", {
-      method: "POST", headers: this.gameHeaders(token),
-      body: new URLSearchParams({ sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web", "manufacturer;": "", play_queue_id: queue_id, user_token: token }),
-    }), "Game queue");
+    const body = new URLSearchParams({ sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web", "manufacturer;": "", play_queue_id: queue_id, user_token: token });
+    // A queue poll that hits a 5xx or a dropped connection used to end the whole
+    // session (one blip on Raccoon's edge = "your game failed"). The call is a
+    // read, so asking once more is safe and costs three seconds at most.
+    let res = null;
+    let lastErr = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const r = await this.raccoonFetch("/jyapi/playQueue", { method: "POST", headers: this.gameHeaders(token), body });
+        if (r.status < 500) { res = r; break; }
+        lastErr = new Error(`Game queue answered HTTP ${r.status}`);
+      } catch (e) { lastErr = e; }
+      if (attempt === 0) await sleep(1200);
+    }
+    if (!res) throw lastErr || new Error("Game queue is briefly unavailable");
+    const d = await parseJsonResponse(res, "Game queue");
     if (d.status !== 200 && d.status !== 201) throw new Error(`Queue poll rejected: ${JSON.stringify(d)}`);
     return d.data?.queue_pos ?? 1;
   }
@@ -1880,13 +1952,30 @@ export class Hub {
 
     // Single-flight per address: a double tap, a retry and a re-render used to be
     // three challenges, and three challenges is a visible slice of an hourly
-    // limit shared by every player this Worker serves.
+    // limit shared by every player this Worker serves. This is checked *before*
+    // the budget, so a waiting caller does not spend a second slot.
     //
     // The shared value is the *answer*, not a Response: a Response body can only
     // be read once, so handing the same object to two waiting requests would
     // fail the second one with "Body has already been read".
     const pending = this.puzzleInflight.get(key);
     if (pending) { const out = await pending; return json(out.body, out.status); }
+
+    // No new ask while Raccoon has told us to stop. This is the line that keeps a
+    // reported 591-second wait from turning into 3543: every extra ask restarts
+    // the window, and the old Worker asked on every click.
+    const lockedFor = this.puzzleBlockRemaining();
+    if (lockedFor > 0) {
+      const out = this.puzzleUnavailable(lockedFor, "The game service is limiting human checks.");
+      return json(out.body, out.status);
+    }
+    // And no more than the local budget allows, so the shared allowance cannot be
+    // spent in one rush and taken away from the next player.
+    if (!this.takePuzzleBudget()) {
+      const out = this.puzzleUnavailable(this.puzzleBudgetWait(), "Human checks are busy right now.");
+      return json(out.body, out.status);
+    }
+
     const work = this.fetchPuzzleChallenge(email, key);
     this.puzzleInflight.set(key, work);
     const clear = () => this.puzzleInflight.delete(key);
@@ -1895,6 +1984,48 @@ export class Hub {
     return json(out.body, out.status);
   }
   puzzleKey(email) { return String(email || "").trim().toLowerCase(); }
+  // ── The shared budget ────────────────────────────────────────────────────
+  // Raccoon's ceiling is per egress IP. Every ask comes from this Worker, so
+  // "a player clicked twice" and "the site used up its allowance" are the same
+  // event. These three hold the line: a local cap on *new* challenges, a
+  // remembered lockout that survives eviction, and one shape for the answer so
+  // the site always shows a wait instead of a slider that cannot pass.
+  puzzleBlockRemaining() { return Math.max(0, Math.ceil((this.puzzleBlockedUntil - Date.now()) / 1000)); }
+  notePuzzleBlocked(seconds, why) {
+    const secs = Math.min(PUZZLE_BLOCK_MAX_MS / 1000, Math.max(30, Number(seconds) || 0));
+    const until = Date.now() + secs * 1000;
+    // Never shorten an existing lockout on the strength of a smaller number.
+    if (until <= this.puzzleBlockedUntil) return;
+    this.puzzleBlockedUntil = until;
+    this.state.waitUntil(this.storage.put("puzzleBlockedUntil", until).catch(() => {}));
+    console.log(`human check locked out for ${Math.ceil(secs)}s (${String(why || "").slice(0, 80)}) — no more asks until then`);
+  }
+  takePuzzleBudget() {
+    const now = Date.now();
+    this.puzzleIssueTimes = this.puzzleIssueTimes.filter((t) => t > now - PUZZLE_ISSUE_WINDOW_MS);
+    if (this.puzzleIssueTimes.length >= PUZZLE_ISSUE_MAX) return false;
+    this.puzzleIssueTimes.push(now);
+    return true;
+  }
+  puzzleBudgetWait() {
+    const oldest = this.puzzleIssueTimes[0];
+    if (!oldest) return 60;
+    return Math.max(30, Math.ceil((oldest + PUZZLE_ISSUE_WINDOW_MS - Date.now()) / 1000));
+  }
+  // One response shape for "there is no check available right now", so the site
+  // has a single thing to recognise and a player has one thing to read.
+  puzzleUnavailable(seconds, why) {
+    const secs = Math.max(30, Math.ceil(Number(seconds) || 60));
+    return {
+      status: 200,
+      body: {
+        error: `${why || "Human checks are temporarily unavailable."} Try again in ${secs} seconds.`,
+        retry_after_seconds: secs,
+        blocked: secs > 120,
+        puzzle_blocked: true,
+      },
+    };
+  }
   // The sn of a solved, still-fresh check for this address, or null.
   verifiedSnFor(key) {
     const now = Date.now();
@@ -1919,6 +2050,10 @@ export class Hub {
         const retryAfter = this.puzzleRetryAfter(d);
         const msg = (d && d.msg) || "Could not load the verification.";
         console.log(`puzzle challenge refused for ${email} (HTTP ${r.status}): ${JSON.stringify(d).slice(0, 160)}`);
+        // Raccoon's own "stop" — remember it, and let nothing ask again until it
+        // expires. Without this every retry pushed the lockout further out.
+        if (retryAfter) this.notePuzzleBlocked(retryAfter, msg);
+        else if (r.status === 429) this.notePuzzleBlocked(300, msg);
         // A refusal means whatever we were holding for this address is not
         // usable either — otherwise the next call would be answered with the
         // same dead challenge and burn the other's time.
