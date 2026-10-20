@@ -44,10 +44,35 @@ const MAIL_DOMAIN_SCREEN_TTL_MS = 6 * 60 * 60 * 1000;
 // sendEmail → register → login). Before this, every solve answered "The puzzle
 // has expired" and no account could be created at all, so the account screen
 // printing 2.3.0 is how you confirm the fix is the build actually being served.
-const API_VERSION = "2.5.0";
+// 2.5.1 — a pooled account is checked before it reaches a player, and an
+// account Raccoon refuses at launch is swapped for another one instead of
+// showing the player an error (see poolAccountUsable / doInitGame). /healthz now
+// answers readiness too, so a dead pool is visible from outside the app.
+// 2.6.0 — the human check is budgeted instead of spent. Raccoon rate-limits
+// `emailRegisterCaptcha` per *egress IP*, and every player's challenge is
+// fetched by this Worker, so they all draw on one budget: five asks in an hour
+// and the answer is "Too many puzzle attempts. Please try again in 3543
+// seconds." for everybody. The relay now reuses a live challenge for the same
+// address, never asks twice for one answer (single-flight), keeps the puzzle
+// session in storage so a Durable Object eviction cannot fake an expiry, and
+// says *which* kind of refusal came back so the site stops answering a wrong
+// drag with a fresh challenge.
+const API_VERSION = "2.6.0";
 // Capabilities the site probes for. Anything missing means the running Worker is
 // an older build than the site expects.
-const API_CAPABILITIES = { puzzle: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true };
+const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true };
+// A challenge is reusable for this long. Raccoon keeps it in its own session and
+// a human needs only a few seconds, so a player re-opening the check (a double
+// tap, a tab switch, a retry after a wrong drag) must get the challenge that is
+// already on their screen instead of spending another one from the shared IP
+// budget. Deliberately short: past this the player has had plenty of time, and a
+// stale image would fail in a way that looks like a wrong answer.
+const PUZZLE_REUSE_MS = 5 * 60 * 1000;
+// A passed challenge is remembered this long so sendEmail/emailRegister retries
+// (a refused mailbox, a dropped connection, a code request the player repeats)
+// do not send the human back to the slider. Raccoon binds the verification to
+// `sn`; this is the same window its own session lives for.
+const PUZZLE_VERIFIED_TTL_MS = 30 * 60 * 1000;
 // Raccoon's registration endpoints sit behind nginx and answer a bare fetch UA
 // with the same puzzle refusal they answer a browser with, so this is not a
 // disguise — it is just the UA the mobile client and the site both send.
@@ -79,6 +104,22 @@ const POOL_FILL_STARTUP_GRACE_MS = 3000;
 // registration, and those registrations are what the mail providers rate-limit.
 // A minute is long enough to stop a broken lane from spinning.
 const POOL_FILL_MAX_BACKOFF_MS = 60000;
+// A pooled account is checked against Raccoon before it is handed to a player.
+// One checkCost call is cheap next to a full registration, but it is still a
+// request per launch, so a pass is remembered for this long: a ban can land at
+// any moment, and a ten-minute-old "this token works" is a much better bet than
+// "it worked some time last week".
+const POOL_CHECK_TTL_MS = 10 * 60 * 1000;
+// How many pooled accounts one launch may check before it gives up and
+// registers. A pool where everything is dead must not turn into a minute of
+// silence on a player's screen; the fill loop then rebuilds it in the
+// background.
+const POOL_CHECK_MAX = 8;
+// Raccoon's wording when the *account* is refused, as opposed to the game
+// ("This game needs diamonds" is status 3004 and is not a dead account). Kept
+// deliberately narrow: a false positive retires a working account, which costs
+// a registration, so an unrecognised answer keeps the account.
+const ACCOUNT_REFUSAL_RE = /not log(ged)? ?in|please log ?in|log in again|login (has )?expired|token (is )?(invalid|expired)|invalid token|unauthori[sz]ed|account (is )?(banned|disabled|blocked)|user (does not|doesn't) exist|不存在|失效|登录/i;
 // How many account registrations may be in flight at once, across every site.
 // Free temp-mail providers rate-limit per provider, not per site, so this is a
 // process-wide cap. The old value was `max_concurrent_sessions * 2` = 30, i.e.
@@ -312,6 +353,14 @@ export class Hub {
     // here, keyed by sn, for the few seconds between challenge → verify →
     // sendEmail → emailRegister, and sent on every one of those calls.
     this.raccoonSessions = new Map(); // sn → { cookie, at }
+    // Challenge handed to a browser, by address, so re-opening the check reuses
+    // it instead of asking Raccoon again (see PUZZLE_REUSE_MS).
+    this.puzzleChallenges = new Map(); // email → { sn, challenge, at }
+    // One in-flight challenge request per address, so a double tap cannot become
+    // two requests on the shared budget.
+    this.puzzleInflight = new Map(); // email → Promise
+    // sn → { email, at }: solved checks that must not be re-opened by a retry.
+    this.verifiedPuzzles = new Map();
     this.accountCreators = 0; // registrations in flight (global — see ACCOUNT_CREATE_MAX)
     this.accountWaiters = []; // players queued for a registration slot, oldest first
     this.capacityWaiters = [];
@@ -344,6 +393,33 @@ export class Hub {
         if (Array.isArray(savedBlocked)) this.blockedMailDomains = new Set(savedBlocked);
         const savedWall = await this.storage.get("raccoonWalledUntil");
         if (typeof savedWall === "number" && savedWall > Date.now()) this.raccoonWalledUntil = savedWall;
+        // Puzzle sessions and solved checks have to outlive this object. A
+        // Durable Object is evicted when it goes quiet, and the gap between a
+        // challenge being handed to a human and that human dragging the slider
+        // is exactly when it goes quiet — which used to drop the session the
+        // verification is bound to and answer a correct drag with "The puzzle
+        // has expired. Please refresh it."
+        const savedRaccoon = await this.storage.get("raccoonSessions");
+        if (Array.isArray(savedRaccoon)) {
+          for (const [sn, v] of savedRaccoon) {
+            if (v && v.cookie && Date.now() - v.at < Hub.PUZZLE_SESSION_TTL_MS) this.raccoonSessions.set(sn, v);
+          }
+        }
+        const savedPuzzles = await this.storage.get("puzzleChallenges");
+        if (Array.isArray(savedPuzzles)) {
+          for (const [email, v] of savedPuzzles) {
+            // The challenge lives under `payload` (the response body minus the
+            // per-request fields), so that — not `v.challenge` — is what has to
+            // be present for the entry to be usable.
+            if (v && v.sn && v.payload && v.payload.challenge && Date.now() - v.at < PUZZLE_REUSE_MS) this.puzzleChallenges.set(email, v);
+          }
+        }
+        const savedVerified = await this.storage.get("verifiedPuzzles");
+        if (Array.isArray(savedVerified)) {
+          for (const [sn, v] of savedVerified) {
+            if (v && Date.now() - v.at < PUZZLE_VERIFIED_TTL_MS) this.verifiedPuzzles.set(sn, v);
+          }
+        }
       } catch (e) {
         console.log(`state load failed: ${e.message}`);
       }
@@ -379,7 +455,15 @@ export class Hub {
     if (signal) return this.handleSignal(request, signal[1]);
 
     // No-auth endpoints.
-    if (path === "/healthz" || path === "/") return json({ status: "ok", name: "ghostcloud-api" });
+    // "/" is liveness (is this Worker running at all); "/healthz" is readiness
+    // (can a player actually start a game right now). Keeping them apart means
+    // a monitor pointed at "/" still goes green after a deploy while a monitor
+    // pointed at "/healthz" can say "degraded" without the two contradicting.
+    if (path === "/") return json({ status: "ok", name: "ghostcloud-api" });
+    if (path === "/healthz") {
+      const health = this.healthReport();
+      return json(health.body, health.status);
+    }
     if (path === "/cloud/v1/inbound") return this.handleInbound(request);
 
     // Everything else needs a valid API key + allowed origin.
@@ -436,6 +520,74 @@ export class Hub {
     return request.headers.get("cf-connecting-ip")
       || request.headers.get("x-caddy-real-ip-is-here1357908642")
       || "unknown";
+  }
+
+  // ── /healthz ────────────────────────────────────────────────────────────
+  // Readiness, not liveness. The old endpoint answered `ok` unconditionally, so
+  // it stayed green through a three-day outage and the first anyone heard about
+  // it was a Discord message. This answers 503 in the one state that really
+  // means "nobody can start a game": the pool is empty and registration has
+  // been failing — either Raccoon's bot wall is up or the recent fills have all
+  // errored. In-memory numbers only (no Raccoon call, no mail provider, no
+  // storage read), so a pinger every minute costs nothing and cannot itself
+  // become the outage.
+  // Deliberately terse: it is a public URL, and "which lane is throttled" is
+  // what diagMail is for.
+  healthReport() {
+    const pool = this.pool.length;
+    const wallLeftMs = Math.max(0, this.raccoonWalledUntil - Date.now());
+    let reason = null;
+    if (pool === 0) {
+      if (wallLeftMs > 0) reason = "registration_walled";
+      else if (this.poolFillFails >= 3) reason = "pool_fill_failing";
+    }
+    const body = { status: reason ? "degraded" : "ok", name: "ghostcloud-api", apiVersion: API_VERSION };
+    if (reason) body.reason = reason;
+    if (wallLeftMs > 0) body.retry_after_seconds = Math.ceil(wallLeftMs / 1000);
+    return { status: reason ? 503 : 200, body };
+  }
+  // Is this pooled account still able to log in? One authenticated checkCost,
+  // for the game the player actually asked for — the same call doInitGame makes,
+  // so a pass here means the launch will get past auth too.
+  //
+  // Three answers, not two: "works", "refused" (retire it) and "don't know" (a
+  // timeout, a 5xx, a reply we do not recognise). Unknown keeps the account — a
+  // Raccoon hiccup must not empty the pool, and the launch itself is the real
+  // test. Only refusal, which is what a ban or a revoked token looks like, costs
+  // the account.
+  async poolAccountUsable(acc, game_key) {
+    if (!acc || !acc.token || !acc.sn) return false;
+    if (!game_key) return true; // no game to price — nothing to ask
+    if (acc.checkedAt && Date.now() - acc.checkedAt < POOL_CHECK_TTL_MS) return true;
+    const common = {
+      sn: acc.sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0",
+      device_name: "GhostCloud", os: "web", "manufacturer;": "", user_token: acc.token,
+    };
+    try {
+      const res = await this.raccoonFetch("/userGame/checkCost", {
+        method: "POST", headers: this.gameHeaders(acc.token),
+        body: new URLSearchParams({ ...common, game_key }),
+      });
+      if (res.status === 401 || res.status === 403) {
+        console.log(`pool: account ${String(acc.sn).slice(0, 6)} refused at auth (HTTP ${res.status}) — dropping it`);
+        return false;
+      }
+      const data = await res.json().catch(() => null);
+      // 3004 is "this game needs diamonds" — the account is fine, it just cannot
+      // play this title, which the launch path already retries around.
+      if (data && typeof data.status === "number" && data.status !== 200 && data.status !== 3004) {
+        const msg = String(data.msg || "");
+        const refused = ACCOUNT_REFUSAL_RE.test(msg);
+        console.log(`pool: account ${String(acc.sn).slice(0, 6)} check answered ${data.status} — ${refused ? "dropping it" : "keeping it"}: ${msg.slice(0, 120)}`);
+        if (refused) return false;
+        return true;
+      }
+      acc.checkedAt = Date.now();
+      return true;
+    } catch (e) {
+      console.log(`pool: account check failed — ${e.message} (keeping the account)`);
+      return true;
+    }
   }
   checkIpLimit(store, ip, windowMs, max) {
     const now = Date.now();
@@ -827,6 +979,9 @@ export class Hub {
       at: Date.now(),
     });
     this.pruneRaccoonSessions();
+    // Durably, because the wait for a human is the one moment this object is
+    // idle enough to be evicted (see the constructor for the whole story).
+    this.state.waitUntil(this.savePuzzleState());
   }
   pruneRaccoonSessions() {
     const now = Date.now();
@@ -837,6 +992,31 @@ export class Hub {
     while (this.raccoonSessions.size > 200) {
       const oldest = this.raccoonSessions.keys().next().value;
       this.raccoonSessions.delete(oldest);
+    }
+    for (const [k, v] of this.puzzleChallenges) {
+      if (now - v.at > PUZZLE_REUSE_MS) this.puzzleChallenges.delete(k);
+    }
+    while (this.puzzleChallenges.size > 100) {
+      this.puzzleChallenges.delete(this.puzzleChallenges.keys().next().value);
+    }
+    for (const [k, v] of this.verifiedPuzzles) {
+      if (now - v.at > PUZZLE_VERIFIED_TTL_MS) this.verifiedPuzzles.delete(k);
+    }
+    while (this.verifiedPuzzles.size > 200) {
+      this.verifiedPuzzles.delete(this.verifiedPuzzles.keys().next().value);
+    }
+  }
+  async savePuzzleState() {
+    try {
+      await Promise.all([
+        this.storage.put("raccoonSessions", [...this.raccoonSessions]),
+        this.storage.put("puzzleChallenges", [...this.puzzleChallenges]),
+        this.storage.put("verifiedPuzzles", [...this.verifiedPuzzles]),
+      ]);
+    } catch (e) {
+      // Never fail a player's check because storage hiccuped — the in-memory
+      // copies still work for as long as this object lives.
+      console.log(`puzzle state save failed: ${e.message}`);
     }
   }
   raccoonSessionHeader(sn) {
@@ -994,13 +1174,28 @@ export class Hub {
     }
     return this.pool.splice(best, 1)[0];
   }
-  async createAccount() {
-    const acc = this.takePooledAccount();
-    if (acc) {
-      console.log(`pool: served (${acc.plays ? `reused x${acc.plays}` : "fresh"}) — ${this.pool.length} left`);
+  async createAccount(game_key) {
+    // Serve from the pool only if the account still logs in. Before this, the
+    // least-used account was handed out unchecked, so the first player after a
+    // ban wave got a failed setup and the account was gone either way — and with
+    // reuse on, one ban wave looked like "the site is broken again" to everyone.
+    // Checking here is what turns that outage into a silent skip to the next
+    // account.
+    let checked = 0;
+    while (checked < POOL_CHECK_MAX) {
+      const acc = this.takePooledAccount();
+      if (!acc) break;
+      checked++;
+      if (await this.poolAccountUsable(acc, game_key)) {
+        console.log(`pool: served (${acc.plays ? `reused x${acc.plays}` : "fresh"}) — ${this.pool.length} left`);
+        this.state.waitUntil(this.savePool());
+        this.ensureTicking();
+        return acc;
+      }
+      // Retired, not recycled: it never reaches another player, and the pool
+      // dropping below target is what makes the tick loop register a new one.
+      console.log(`pool: dropped a dead account — ${this.pool.length} left`);
       this.state.waitUntil(this.savePool());
-      this.ensureTicking();
-      return acc;
     }
     const created = await this.createAccountRaw();
     this.ensureTicking();
@@ -1062,6 +1257,14 @@ export class Hub {
     if (playData.status === 3004 || String(playData.msg || "").toLowerCase().includes("diamond")) {
       const err = new Error("This game needs play credits the temporary account doesn't have — try again in a moment or pick another game.");
       err.isDiamondError = true;
+      throw err;
+    }
+    // The account was refused at launch — a ban or a token that went stale while
+    // it sat in the pool. The caller swaps in another account instead of showing
+    // the player an error, which is the whole point of the pool.
+    if (playData.status !== 200 && playData.status !== 201 && ACCOUNT_REFUSAL_RE.test(String(playData.msg || ""))) {
+      const err = new Error(`Raccoon refused the account: ${String(playData.msg || "").slice(0, 120)}`);
+      err.accountRefused = true;
       throw err;
     }
     if (playData.status === 201 || (playData.status === 200 && playData.data?.play_queue_id)) {
@@ -1422,7 +1625,7 @@ export class Hub {
           throw Object.assign(new Error("no registration slot free in time"), { busy: true });
         }
         w.push({ status: "creating_account" });
-        const fresh = await this.createAccount();
+        const fresh = await this.createAccount(game_key);
         bindAccount(fresh);
         if (!this.sessions.has(uuid) || w.ended) { this.releaseAccountSlotFor(w); return; }
         w.push({ status: "account_ready" });
@@ -1431,22 +1634,27 @@ export class Hub {
       this.recordUsage(apiKey);
       w.push({ status: "requesting_game" });
       let init = null;
-      let creditRetries = 0;
+      let accountRetries = 0;
       while (!init) {
         try { init = await this.doInitGame(session); }
         catch (e) {
-          if (e && e.isDiamondError && !manualAccount && creditRetries < 2) {
-            creditRetries++;
-            console.log(`no credits on ${uuid.slice(0, 8)} — trying another account (${creditRetries})`);
-            w.push({ status: "creating_account" });
-            // The account we are dropping is marked dead rather than recycled:
-            // it cannot play the requested game, so handing it to the next player
-            // would just move the same failure one seat along.
-            session.account_dead = true;
-            bindAccount(await this.createAccount());
-            w.push({ status: "account_ready" });
-            w.push({ status: "requesting_game" });
-            continue;
+          // Two reasons to try a different account: no play credits for this
+          // game, and Raccoon refusing the account outright. Both mean the
+          // player should never see the failure — there is a pool for this.
+          if ((e && e.isDiamondError) || (e && e.accountRefused)) {
+            if (!manualAccount && accountRetries < 2) {
+              accountRetries++;
+              console.log(`${e.accountRefused ? "account refused" : "no credits"} on ${uuid.slice(0, 8)} — trying another account (${accountRetries})`);
+              w.push({ status: "creating_account" });
+              // The account we are dropping is marked dead rather than recycled:
+              // it cannot play the requested game, so handing it to the next player
+              // would just move the same failure one seat along.
+              session.account_dead = true;
+              bindAccount(await this.createAccount(game_key));
+              w.push({ status: "account_ready" });
+              w.push({ status: "requesting_game" });
+              continue;
+            }
           }
           throw e;
         }
@@ -1473,8 +1681,7 @@ export class Hub {
       console.log(`creation failed for ${uuid.slice(0, 8)} — ${e.message}`);
       w.push(this.sessionErrorEvent(e));
       this.killSession(uuid, "creation_error");
-    } finally {
-      try { w.controller.close(); } catch {}
+    } finally {      try { w.controller.close(); } catch {}
     }
   }
 
@@ -1651,6 +1858,53 @@ export class Hub {
   async handleCaptchaChallenge(ctx) {
     const email = String((ctx.body || {}).email || "").trim();
     if (!email) return json({ error: "Enter an email address first." }, 400);
+    const key = this.puzzleKey(email);
+
+    // Already solved, and recently enough that Raccoon still holds it. The
+    // player is not asked to drag anything a second time — that is the whole
+    // point of remembering the result: a retried code request, a reopened tab
+    // or a dropped connection must not cost another human check.
+    const solved = this.verifiedSnFor(key);
+    if (solved) {
+      console.log(`puzzle: reusing a solved check for ${email}`);
+      return json({ sn: solved, email, verified: true, reusedVerification: true });
+    }
+
+    // A challenge this player already has on screen is the right answer to
+    // "give me the check". Asking Raccoon again would replace the image they may
+    // be aiming at AND spend another request from the shared IP budget.
+    const held = this.puzzleChallenges.get(key);
+    if (held && Date.now() - held.at < PUZZLE_REUSE_MS && this.raccoonSessions.has(held.sn)) {
+      return json({ ...held.payload, sn: held.sn, email, reused: true });
+    }
+
+    // Single-flight per address: a double tap, a retry and a re-render used to be
+    // three challenges, and three challenges is a visible slice of an hourly
+    // limit shared by every player this Worker serves.
+    //
+    // The shared value is the *answer*, not a Response: a Response body can only
+    // be read once, so handing the same object to two waiting requests would
+    // fail the second one with "Body has already been read".
+    const pending = this.puzzleInflight.get(key);
+    if (pending) { const out = await pending; return json(out.body, out.status); }
+    const work = this.fetchPuzzleChallenge(email, key);
+    this.puzzleInflight.set(key, work);
+    const clear = () => this.puzzleInflight.delete(key);
+    work.then(clear, clear);
+    const out = await work;
+    return json(out.body, out.status);
+  }
+  puzzleKey(email) { return String(email || "").trim().toLowerCase(); }
+  // The sn of a solved, still-fresh check for this address, or null.
+  verifiedSnFor(key) {
+    const now = Date.now();
+    for (const [sn, v] of this.verifiedPuzzles) {
+      if (now - v.at > PUZZLE_VERIFIED_TTL_MS) { this.verifiedPuzzles.delete(sn); continue; }
+      if (v.email === key) return sn;
+    }
+    return null;
+  }
+  async fetchPuzzleChallenge(email, key) {
     const sn = generateSN();
     const t0 = Date.now();
     try {
@@ -1662,29 +1916,45 @@ export class Hub {
       this.captureRaccoonSession(sn, r);
       const d = await r.json().catch(() => null);
       if (!d || d.status !== 200 || !d.data || !d.data.challenge_id) {
+        const retryAfter = this.puzzleRetryAfter(d);
+        const msg = (d && d.msg) || "Could not load the verification.";
         console.log(`puzzle challenge refused for ${email} (HTTP ${r.status}): ${JSON.stringify(d).slice(0, 160)}`);
-        return json({
-          error: (d && d.msg) || "Could not load the verification.",
-          retry_after_seconds: this.puzzleRetryAfter(d),
-        }, 200);
+        // A refusal means whatever we were holding for this address is not
+        // usable either — otherwise the next call would be answered with the
+        // same dead challenge and burn the other's time.
+        this.puzzleChallenges.delete(key);
+        return {
+          status: 200,
+          body: {
+            error: msg,
+            retry_after_seconds: retryAfter,
+            // A wait measured in minutes is not something the modal can sit on:
+            // Raccoon's own limit is an hour, and pretending the player can wait
+            // it out with a disabled slider is what made this feel broken.
+            blocked: !!retryAfter && retryAfter > 120,
+          },
+        };
       }
       const c = d.data;
-      return json({
-        sn,
-        email,
+      const payload = {
         ms: Date.now() - t0,
         challenge: {
           challenge_id: c.challenge_id, background: c.background, piece: c.piece,
           width: c.width, height: c.height, piece_size: c.piece_size, piece_y: c.piece_y,
         },
-      });
-    } catch (e) { return json({ error: e.message }, 500); }
+      };
+      this.puzzleChallenges.set(key, { sn, payload, at: Date.now() });
+      this.pruneRaccoonSessions();
+      this.state.waitUntil(this.savePuzzleState());
+      return { status: 200, body: { sn, email, ...payload } };
+    } catch (e) { return { status: 500, body: { error: e.message } }; }
   }
   async handleCaptchaVerify(ctx) {
     const { email, sn, challenge_id, offset } = ctx.body || {};
     if (!email || !sn || !challenge_id || offset === undefined || offset === null) {
       return json({ error: "Missing puzzle fields." }, 400);
     }
+    const key = this.puzzleKey(email);
     try {
       const r = await this.raccoonFetch("/users/emailRegisterCaptchaVerify", {
         method: "POST",
@@ -1700,12 +1970,33 @@ export class Hub {
       });
       this.captureRaccoonSession(sn, r); // it may rotate the session on success
       const d = await r.json().catch(() => null);
-      if (d && d.status === 200) return json({ verified: true, sn });
-      console.log(`puzzle verify refused (HTTP ${r.status}): ${JSON.stringify(d).slice(0, 160)}`);
+      if (d && d.status === 200) {
+        // Remember the pass so a retried code request does not send the player
+        // back to the slider (see verifiedSnFor).
+        this.verifiedPuzzles.set(sn, { email: key, at: Date.now() });
+        this.puzzleChallenges.delete(key);
+        this.pruneRaccoonSessions();
+        this.state.waitUntil(this.savePuzzleState());
+        return json({ verified: true, sn });
+      }
+      const msg = (d && d.msg) || "Verification failed.";
+      const retryAfter = this.puzzleRetryAfter(d);
+      // Say which refusal this is, in a shape the site can act on. A wrong drag
+      // is answered by letting the player aim again; only an expired challenge
+      // needs a new one, and only a rate limit needs a wait. Before this the
+      // site treated all three the same way — fetch another challenge — which is
+      // how one careful player could empty the shared budget by themselves.
+      const expired = /expired|refresh/i.test(msg);
+      const mismatch = /does not match|not match|wrong position|not quite/i.test(msg);
+      console.log(`puzzle verify refused (HTTP ${r.status}, ${expired ? "expired" : mismatch ? "wrong offset" : "other"}): ${JSON.stringify(d).slice(0, 160)}`);
+      if (expired || retryAfter) this.puzzleChallenges.delete(key);
       return json({
         verified: false,
-        error: (d && d.msg) || "Verification failed.",
-        retry_after_seconds: this.puzzleRetryAfter(d),
+        error: msg,
+        expired,
+        mismatch,
+        blocked: !!retryAfter && retryAfter > 120,
+        retry_after_seconds: retryAfter,
       });
     } catch (e) { return json({ error: e.message }, 500); }
   }

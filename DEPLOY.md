@@ -546,6 +546,42 @@ The fix is entirely in `stratus/js/app.js` (site only — no API change):
 
 `node .freebuff/test_puzzle_cooldown.js` covers all of it in a stub DOM.
 
+**2.6.0 — the check is a budget, not a button.** Measured live on 2026-10-20:
+five `emailRegisterCaptcha` calls from one IP, and the sixth answered
+`429 Too many puzzle attempts. Please try again in 3543 seconds.` Raccoon limits
+by *egress IP*, and this Worker is that IP for every player on the site, so one
+person dragging badly could take the human check away from everybody for an
+hour. The old site made that worse: every wrong drag fetched a brand-new
+challenge, 900ms later, automatically.
+
+What changed (API 2.6.0 + `app.js?v=16`):
+
+- **One challenge per address, reused for 5 minutes** (`PUZZLE_REUSE_MS`).
+  Re-opening the check — a double tap, a tab switch, a retry — returns the image
+  already on the player's screen instead of spending another ask.
+- **Single-flight per address.** Concurrent asks share one upstream call. (The
+  shared value is the answer, not a `Response`: a body can only be read once.)
+- **Persisted, not in-memory.** The Raccoon session, the cached challenge and
+  every solved `sn` are written to DO storage, because the wait for a human is
+  exactly when the object goes idle enough to be evicted. Losing that session is
+  what turns a correct drag into "The puzzle has expired. Please refresh it."
+- **Refusals are classified**: `expired`, `mismatch` (wrong position) and
+  `retry_after_seconds`. Only an expiry asks Raccoon again.
+- **A solved check is remembered for 30 minutes**, so a retried code or a
+  reopened tab never sends the player back to the slider (`reusedVerification`).
+- **`blocked: true`** on any wait longer than two minutes, and the site says so
+  in minutes instead of running a 57-minute countdown into a disabled slider.
+  The site makes that decision from the number too, so it behaves the same
+  against an older API build.
+- **The site retries in place.** A wrong drag keeps the challenge and resets the
+  thumb; nothing is re-fetched behind the player's back.
+- `GHOSTCLOUD_POOL_TARGET` is 10 (was 6): while the check is unavailable, the
+  pool is the only thing that can start a game.
+
+Tests: `node .freebuff/test_puzzle_cache.mjs` drives the real `Hub` class with a
+stubbed Raccoon and in-memory DO storage (cache, single-flight, eviction,
+classification); `node .freebuff/test_puzzle_cooldown.js` covers the modal.
+
 ## "I redeployed and nothing changed"
 
 The most common cause is that the new build is not the one being served — an edge

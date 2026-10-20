@@ -35,7 +35,14 @@ class_name = "Hub"
 # (POOL_FILL_MIN_DELAY_MS = 20s), not by the target size — a full pool costs
 # nothing at idle, and a draining one is capped at one fill attempt per 20s.
 # Queue pressure, on the other hand, scales directly with how small this is.
-GHOSTCLOUD_POOL_TARGET = "6"
+#
+# 6 → 10 (2026-10-20): Raccoon's human check is rate-limited per *egress IP*,
+# and this Worker is that IP for every player. When the budget is spent for an
+# hour (seen live: "Too many puzzle attempts. Please try again in 3406
+# seconds.") no new account can be made, so the only thing standing between a
+# player and a game is the pool. A wider buffer is the difference between
+# "a few people wait" and "nobody plays until the hour rolls over".
+GHOSTCLOUD_POOL_TARGET = "10"
 # Reuse a finished session's account for the next player instead of registering a
 # brand-new one for every session (which is what got Raccoon's registration
 # endpoint gated behind a bot check). Set to "off" to go back to one account per
