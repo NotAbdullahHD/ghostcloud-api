@@ -75,10 +75,22 @@ const MAIL_DOMAIN_SCREEN_TTL_MS = 6 * 60 * 60 * 1000;
 // state of a busy site: players saw a dead end for 20 minutes at a time and
 // nothing ever seeded the pool. `unlockInSeconds` lets the site show the offer
 // with a live countdown, and its own-account route is named in the sentence.
-const API_VERSION = "2.9.0";
+// 3.0.0 — nobody is turned away for being busy any more. Every wall on the play
+// path is a place to wait: an exhausted per-IP burst, the site's own per-minute
+// cap, a full registration queue, a mail provider answering 429, and a provider
+// lane that will not give up a code. Each of those used to end the player's
+// attempt with a sentence, and the sentence was always some version of "too
+// many requests" or "try again" — an outage made of individual apologies. Now
+// the stream stays open, the player keeps a position, and the attempt is retried
+// behind them. The only remaining failure that reaches a player is the one a
+// human check fixes (an empty pool at Raccoon's registration wall), and that is
+// a specific, labelled offer (`noAccounts`) rather than something the site has
+// to infer from `capacity`. That distinction is the other half of this release: a
+// throttle must never show "Unlock free play", because a drag cannot fix a 429.
+const API_VERSION = "3.0.0";
 // Capabilities the site probes for. Anything missing means the running Worker is
 // an older build than the site expects.
-const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, optInUnlock: true, unlockCountdown: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true };
+const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, optInUnlock: true, unlockCountdown: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true, queueAll: true, offerOnlyWhenEmpty: true, queueEta: true };
 // How many *new* challenges this Worker will ask Raccoon for in a window. Kept
 // well below the observed limit on purpose: a refusal locks the check out for
 // everyone for an hour, and a challenge reused or remembered costs nothing.
@@ -160,7 +172,22 @@ const ACCOUNT_CREATE_MAX = 2;
 // How long a player may wait for one of those registration slots before we give
 // up. The client drops a setup stream that goes quiet for 90s, so the wait loop
 // below emits a progress event well inside that window.
-const ACCOUNT_SLOT_WAIT_MS = 150000;
+//
+// 3.0.0 raised this from 2.5 minutes. A player who waits six minutes and then
+// plays is a player; a player who is told "busiest right now, try again" at 2.5
+// minutes is the complaint this whole change exists to remove. The wait is
+// bounded so a dead provider cannot hold somebody forever.
+const ACCOUNT_SLOT_WAIT_MS = 6 * 60 * 1000;
+// When every mail lane is throttled or refusing, that is congestion, not a
+// verdict: the account attempt is retried inside the player's own stream, so
+// "Too many requests." from a provider becomes a line position instead of a red
+// sentence. Three rounds with growing gaps covers the ~60s a free provider's
+// throttle usually lasts without holding anybody for another registration.
+const ACCOUNT_RETRY_ROUNDS = 3;
+const ACCOUNT_RETRY_BACKOFF_MS = [8000, 20000, 40000];
+// The site's own per-minute cap (see sites.js) is another wall a player must not
+// meet on Play. Wait it out in the line instead of answering with an error.
+const RATE_LIMIT_WAIT_MS = 3 * 60 * 1000;
 // Session endings that mean the *account* is finished too, so it must not go back
 // into the pool. "upstream_terminated" is Raccoon's own status 3013 (it killed
 // the account); "creation_error" never produced a working one.
@@ -174,6 +201,8 @@ const QUEUE_BROADCAST_MS = 4000;
 const QUEUED_MAX_AGE = 30 * 60 * 1000;
 const QUEUED_POLL_STALE_AFTER = 90000;
 const SETUP_DEADLINE_MS = 5 * 60 * 1000;
+// Printed only as a warning: an account slot wait plus provider retries can now
+// legitimately take longer than this, and a slow setup is not a failure.
 const STARTGAME_DEADLINE_MS = 30000;
 const QUEUE_ABANDON_MS = 60000;
 // The site pings every 45s; allow two missed pings before dropping a session so
@@ -187,7 +216,22 @@ const PING_TIMEOUT_MS = 120000;
 // the slower ping path. A client that is still pinging keeps refreshing it.
 const CLIENT_REATTACH_GRACE_MS = 90000;
 // Deadlines for states that never got their timers cleared.
-const REAPER_DEADLINES = { creating: 5 * 60 * 1000, finished_queue: 2 * 60 * 1000 };
+// `creating` has to outlast ACCOUNT_SLOT_WAIT_MS plus the provider retries,
+// otherwise the reaper kills a player who is still legitimately in line — the
+// exact "it just stops" bug that made waiting pointless.
+const REAPER_DEADLINES = { creating: 12 * 60 * 1000, finished_queue: 2 * 60 * 1000 };
+// Endpoints a player reaches by pressing a button in the player, rather than by
+// the site making an account. These never answer with the per-IP burst limit:
+// they queue instead (see route() and waitForRateLimit).
+const SESSION_PATHS = new Set([
+  "/cloud/v1/createSession",
+  "/cloud/v1/getQueue",
+  "/cloud/v1/startGame",
+  "/cloud/v1/pingSession",
+  "/cloud/v1/quitSession",
+  "/cloud/v1/capabilities",
+  "/cloud/v1/online",
+]);
 
 // ── pure helpers ────────────────────────────────────────────────────────────
 const enc = new TextEncoder();
@@ -248,6 +292,11 @@ async function parseJsonResponse(res, what) {
 // provider name, an HTTP code, or a "why" — all of that is accurate and none of
 // it is the player's problem.
 const BUSY_MESSAGE = "We're at our busiest right now and couldn't set up your game in time — please try again in a moment. Nothing is wrong on your side.";
+// The per-IP burst answer for the endpoints that keep it (mailbox, code, the
+// account flow). Never "Too many requests.": that sentence reads as a fault and
+// is what people screenshot. It is also not what happened — they went a little
+// fast, and a few seconds fixes it.
+const RATE_LIMITED_MESSAGE = "You're going a little fast — give it a few seconds and try again.";
 // Shown only while Raccoon's bot wall is up. That is a *known outage*, not a busy
 // spell: every retry gets the same refusal, so telling the player to retry is a
 // lie that also spends quota. Say what is actually true and point at the path
@@ -529,8 +578,19 @@ export class Hub {
     const ip = this.clientIp(request);
     // Presence pings are tiny and a school can share one NAT IP — don't let them
     // trip the per-IP burst limit.
-    if (!path.startsWith("/cloud/v1/heartbeat") && !path.startsWith("/cloud/v1/online")) {
-      if (!this.checkIpLimit(this.ipLimits, ip, 60000, 100)) return json({ error: "Too many requests." }, 429);
+    //
+    // 3.0.0: the *session* endpoints are excluded too. "Too many requests." was
+    // being returned to people pressing Play — a family, a school, a mobile
+    // carrier's shared address, or simply a player who retried while the first
+    // attempt was still streaming. A burst limit is the wrong tool there: these
+    // calls already queue, one player at a time, behind max_concurrent_sessions
+    // and the registration slots, which is a throttle that still lets everybody
+    // in. The limit stays on the account/mailbox endpoints, where the thing it
+    // protects is a provider's quota rather than a player's click.
+    const sessionPath = SESSION_PATHS.has(path);
+    const cheap = path.startsWith("/cloud/v1/heartbeat") || path.startsWith("/cloud/v1/online");
+    if (!cheap && !sessionPath) {
+      if (!this.checkIpLimit(this.ipLimits, ip, 60000, 100)) return json({ error: RATE_LIMITED_MESSAGE }, 429);
     }
 
     const ctx = { site, apiKey, body, ip, request, url };
@@ -815,29 +875,45 @@ export class Hub {
     // 43-minute countdown on a Play button, so the hint is dropped for these and
     // the event says "capacity" instead.
     const auto = !!(e && e.auto);
+    // An *automatic* account attempt blocked by Raccoon's registration gate is
+    // the only failure a human check can fix — the pool is empty and no
+    // unattended registration can fill it. Everything else on this path (a mail
+    // provider answering 429, every lane refusing, this Worker's own budget) is
+    // congestion: it clears by waiting, and a drag cannot help it.
+    const autoWall = auto && (!!(e && e.raccoonWall) || this.isRaccoonWall(e && e.message));
     const wall = !auto && ((!!(e && e.raccoonWall)) || this.isRaccoonWall(e && e.message));
     const out = { status: "error", error: playerMessage(e), needVerification: wall };
     if (auto) {
       out.capacity = true;
-      const left = Math.ceil(Math.max(0, this.raccoonWalledUntil - Date.now()) / 1000);
-      if (left > 0) out.retry_after_seconds = left;
-      // The one legitimate way out. `canUnlock` is an *offer*, never an action:
-      // the site shows a button, the player chooses, and the drag happens in
-      // their own browser. Without it an empty pool is a dead end; with it, one
-      // person's check creates an account that every player after them reuses.
-      out.canUnlock = this.puzzleAvailable();
-      // When the check is closed, say exactly how long for. Every player who
-      // pressed Play during a 20-minute lockout used to read a sentence about
-      // retrying in "a few minutes" and no way to act on it, which is what an
-      // empty pool looks like from the outside — nothing happens, ever.
-      out.unlockInSeconds = out.canUnlock ? 0 : this.puzzleReopensIn();
+      // The explicit label the site acts on. `capacity` means "wait, this is not
+      // your fault"; `noAccounts` means "there is no account and none can be
+      // made without a human" — the only case that earns the Unlock offer. They
+      // were the same flag until 3.0.0, which is why a throttle during a busy
+      // minute put a captcha button in front of somebody whose real problem was
+      // a 429 that no amount of dragging could clear.
+      out.noAccounts = !!autoWall;
       out.pool = this.pool.length;
       out.poolTarget = this.POOL_TARGET;
-      if (out.canUnlock) {
-        out.error = `${out.error} You can also bring free play back yourself \u2014 one quick check, and the account it creates is shared with everyone.`;
-      } else {
-        const mins = Math.max(1, Math.ceil(out.unlockInSeconds / 60));
-        out.error = `${out.error} A human check is the only way back, and the game service is limiting those right now \u2014 the next one can be tried in about ${mins} ${mins === 1 ? "minute" : "minutes"}. You can also play right away with your own game account in Settings \u2192 Account.`;
+      const left = Math.ceil(Math.max(0, this.raccoonWalledUntil - Date.now()) / 1000);
+      if (left > 0) out.retry_after_seconds = left;
+      // Only the empty-pool case carries the offer at all. `canUnlock` is an
+      // *offer*, never an action: the site shows a button, the player chooses,
+      // and the drag happens in their own browser. Without it an empty pool is a
+      // dead end; with it, one person's check creates an account that every
+      // player after them reuses.
+      if (out.noAccounts) {
+        out.canUnlock = this.puzzleAvailable();
+        // When the check is closed, say exactly how long for. Every player who
+        // pressed Play during a 20-minute lockout used to read a sentence about
+        // retrying in "a few minutes" and no way to act on it, which is what an
+        // empty pool looks like from the outside — nothing happens, ever.
+        out.unlockInSeconds = out.canUnlock ? 0 : this.puzzleReopensIn();
+        if (out.canUnlock) {
+          out.error = `${out.error} You can also bring free play back yourself \u2014 one quick check, and the account it creates is shared with everyone.`;
+        } else {
+          const mins = Math.max(1, Math.ceil(out.unlockInSeconds / 60));
+          out.error = `${out.error} A human check is the only way back, and the game service is limiting those right now \u2014 the next one can be tried in about ${mins} ${mins === 1 ? "minute" : "minutes"}. You can also play right away with your own game account in Settings \u2192 Account.`;
+        }
       }
     }
     return out;
@@ -1525,8 +1601,10 @@ export class Hub {
     if (this.capacityWaiters.length) {
       for (const w of this.capacityWaiters) {
         if (!w.started && !w.ended && now - w.enqueuedAt > QUEUED_MAX_AGE) {
-          // Be honest instead of holding somebody for hours in a dead line.
-          w.push({ status: "error", error: "The line is too long right now — please try again later." });
+          // Be honest instead of holding somebody for hours in a dead line —
+          // but say it as a wait, not a fault, and let the site offer the
+          // own-account route instead of painting a red wall.
+          w.push({ status: "error", error: "The line for a free slot is still long after half an hour. Nothing is wrong on your side — keep this open and press Play again shortly, or play now with your own game account.", capacity: true });
           try { w.controller.close(); } catch {}
           w.ended = true;
         }
@@ -1673,13 +1751,77 @@ export class Hub {
     return waiter;
   }
 
+  // The site's per-minute/per-day caps protect the API key, not the player, and
+  // a player pressing Play has no way to know one exists. 3.0.0 waits the window
+  // out in the line instead of answering with BUSY_MESSAGE: the line is the same
+  // queue they already understand, and a wait of a few seconds is invisible.
+  async waitForRateLimit(w) {
+    const deadline = Date.now() + RATE_LIMIT_WAIT_MS;
+    let lastNoticeAt = 0;
+    for (;;) {
+      if (w.ended) return false;
+      const rl = this.checkRateLimit(w.apiKey, w.site);
+      if (rl.allowed) return true;
+      if (Date.now() >= deadline) return false;
+      if (Date.now() - lastNoticeAt > 4000) {
+        lastNoticeAt = Date.now();
+        w.push({ status: "capacity_queue", position: 1, waited_seconds: Math.round((Date.now() - w.enqueuedAt) / 1000), reason: "limit", eta_seconds: 15 });
+      }
+      await sleep(2000);
+    }
+  }
+  // Register an account, and treat congestion as congestion. createAccountRaw
+  // already walks every lane with its own backoff; what it cannot absorb is a
+  // provider that is still answering 429 after that, and until 3.0.0 that moment
+  // ended the player's attempt with "we're at our busiest". Now the attempt is
+  // retried inside their stream, with a position, so the worst case is a longer
+  // wait rather than a second press of Play. A *wall* is different: it refuses
+  // every address until a human acts, so it is thrown at once and becomes the
+  // labelled offer.
+  async createAccountWithRetries(w, game_key) {
+    // A tab that closed between the slot being granted and this line must not
+    // spend a registration (the dearest thing this Worker has) on nobody.
+    if (w.ended) return null;
+    let round = 0;
+    for (;;) {
+      try {
+        const acc = await this.createAccount(game_key);
+        return w.ended ? null : acc;
+      } catch (e) {
+        if (w.ended) return null;
+        const wall = !!(e && e.raccoonWall) || this.isRaccoonWall(e && e.message);
+        if (wall || round >= ACCOUNT_RETRY_ROUNDS) throw e;
+        const wait = Math.min(ACCOUNT_RETRY_BACKOFF_MS[round] ?? 40000, Math.max(0, e?.retryAfterMs || 0) || 40000);
+        round++;
+        console.log(`account attempt failed for ${String(w.sessionUuid || "?").slice(0, 8)} (${e.message}) — retry ${round}/${ACCOUNT_RETRY_ROUNDS} in ${Math.round(wait / 1000)}s`);
+        w.push({
+          status: "capacity_queue",
+          position: 1,
+          waited_seconds: Math.round((Date.now() - w.enqueuedAt) / 1000),
+          reason: "provider",
+          eta_seconds: Math.round(wait / 1000),
+        });
+        // Stay inside the client's 90s idle window: a retry gap longer than that
+        // would look like a dead stream and cost the player everything they have
+        // waited for so far.
+        const until = Date.now() + wait;
+        while (Date.now() < until && !w.ended) {
+          await sleep(Math.min(15000, Math.max(0, until - Date.now())));
+          if (w.ended) return null;
+          if (until - Date.now() > 5000) {
+            w.push({ status: "capacity_queue", position: 1, waited_seconds: Math.round((Date.now() - w.enqueuedAt) / 1000), reason: "provider", eta_seconds: Math.max(1, Math.round((until - Date.now()) / 1000)) });
+          }
+        }
+      }
+    }
+  }
   async runCreateSessionFlow(w) {
     const { apiKey, site, game_key, manualAccount } = w;
     const startedAt = Date.now();
-    const rl = this.checkRateLimit(apiKey, site);
-    if (!rl.allowed) {
-      console.log(`rate limited ${String(apiKey).slice(-6)} — ${rl.reason}`);
-      w.push({ status: "error", error: BUSY_MESSAGE });
+    if (!(await this.waitForRateLimit(w))) {
+      if (w.ended) return;
+      console.log(`rate limit for ${String(apiKey).slice(-6)} outlasted the wait window`);
+      w.push({ status: "error", error: BUSY_MESSAGE, capacity: true });
       try { w.controller.close(); } catch {}
       return;
     }
@@ -1727,7 +1869,8 @@ export class Hub {
           throw Object.assign(new Error("no registration slot free in time"), { busy: true });
         }
         w.push({ status: "creating_account" });
-        const fresh = await this.createAccount(game_key);
+        const fresh = await this.createAccountWithRetries(w, game_key);
+        if (!fresh) { this.releaseAccountSlotFor(w); return; } // player left mid-retry
         bindAccount(fresh);
         if (!this.sessions.has(uuid) || w.ended) { this.releaseAccountSlotFor(w); return; }
         w.push({ status: "account_ready" });

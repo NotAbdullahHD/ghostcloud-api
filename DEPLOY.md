@@ -681,6 +681,58 @@ An empty pool also stops being silent:
   whether the check is open, and the puzzle modal no longer repeats the wait
   twice ("Try again in 47 seconds. Try again in 22s.").
 
+**3.0.0 — nobody is turned away for being busy.**
+
+Every wall on the play path became a place to wait. The complaint that forced
+this was two sentences long: *"too many requests"* and *"IP error"*, on a site
+whose players only ever pressed Play. Each of those was a real limiter doing its
+job at the wrong moment, and each ended somebody's attempt:
+
+- **The per-IP burst limit no longer covers the session endpoints.**
+  `createSession`, `getQueue`, `startGame`, `pingSession`, `quitSession`,
+  `capabilities` and `online` are exempt (`SESSION_PATHS`). 100 requests/minute
+  per address sounds generous until a household, a school or a mobile carrier's
+  NAT shares it — and pressing Play twice while the first attempt is still
+  streaming counted twice. Those calls already queue behind
+  `max_concurrent_sessions` and the registration slots, which is a throttle that
+  still lets everybody in. The limit stays on the mailbox/code endpoints, where
+  it protects a provider's quota rather than a player's click, and its answer is
+  now a sentence (`RATE_LIMITED_MESSAGE`), never "Too many requests.".
+- **The site's own per-minute cap waits instead of failing.** `waitForRateLimit`
+  holds the player in the line (`reason: "limit"`) and starts the setup when the
+  window reopens, instead of pushing `BUSY_MESSAGE` and closing the stream.
+- **A registration slot is worth six minutes, not two and a half.**
+  `ACCOUNT_SLOT_WAIT_MS` is now 6 min and `REAPER_DEADLINES.creating` is 12 min so
+  the reaper cannot kill somebody who is legitimately still in line (it used to
+  cut at 5 minutes, which is why long waits "just stopped").
+- **A throttled account attempt is retried inside the player's stream.**
+  `createAccountWithRetries` re-attempts a non-wall failure up to three times
+  (8s/20s/40s, honouring a provider's `retry-after`), pushing
+  `capacity_queue` with `reason: "provider"` and an `eta_seconds` between
+  attempts. `createAccountRaw` already walked every mail lane with its own
+  backoff; this covers the case it could not absorb. A tab that closes mid-wait
+  stops immediately and spends no registration.
+- **`noAccounts` is a separate signal from `capacity`.** Only an automatic
+  account attempt blocked by Raccoon's registration gate sets it, and only that
+  case carries `canUnlock`/`unlockInSeconds`. A 429 is congestion a drag cannot
+  clear, so it must never show the Unlock button — which is exactly what the old
+  `capacity`-only flag did.
+
+Site side (`app.js?v=19`): the offer is gated on `noAccounts` (with a legacy
+fallback for a pre-3.0.0 Worker), a busy answer is retried once after the wait it
+asked for, busy text is no longer painted red or toasted as a failure, the
+"own account" route is offered on a throttle too, and the queue line says which
+line you are in ("#3 in line for a free account" vs "all server slots busy")
+with an ETA when the API gives one.
+
+Tests: `test_queue_everyone.js` (new) covers the burst exemption, the calm
+rate-limit sentence, the `noAccounts` matrix, the in-stream retry, the wall not
+being retried, and a closed tab spending nothing. Section 11 of
+`test_inline_provision.js` drives the real `playGame` with a `capacity` /
+`noAccounts: false` answer and asserts the button stays hidden, nothing turns
+red, one retry happens and the own-account route is shown; section 12 pins the
+legacy fallback.
+
 ## "I redeployed and nothing changed"
 
 The most common cause is that the new build is not the one being served — an edge
