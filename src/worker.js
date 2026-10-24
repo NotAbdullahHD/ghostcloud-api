@@ -87,18 +87,36 @@ const MAIL_DOMAIN_SCREEN_TTL_MS = 6 * 60 * 60 * 1000;
 // a specific, labelled offer (`noAccounts`) rather than something the site has
 // to infer from `capacity`. That distinction is the other half of this release: a
 // throttle must never show "Unlock free play", because a drag cannot fix a 429.
-const API_VERSION = "3.0.0";
+// 3.1.0 — the check allowance was the last thing standing between a player and
+// an account, and it was set above Raccoon's own ceiling: six asks per quarter of
+// an hour, where the fifth ask already earns "try again in 3543 seconds". Worse,
+// the allowance lived only in memory, so every deploy started a fresh window and
+// the first handful of players after it walked the site straight back into the
+// hour-long lockout. It is now three per hour (below the ceiling), persisted, and
+// it says *who* is limiting the check — `limited_by: "site"` for our own
+// allowance, `"service"` for Raccoon's lockout. Those two need different advice
+// and they used to share one sentence that blamed the game service for our own
+// choice.
+const API_VERSION = "3.1.0";
 // Capabilities the site probes for. Anything missing means the running Worker is
 // an older build than the site expects.
-const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, optInUnlock: true, unlockCountdown: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true, queueAll: true, offerOnlyWhenEmpty: true, queueEta: true };
+const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, optInUnlock: true, unlockCountdown: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true, queueAll: true, offerOnlyWhenEmpty: true, queueEta: true, checkLimitedBy: true };
 // How many *new* challenges this Worker will ask Raccoon for in a window. Kept
 // well below the observed limit on purpose: a refusal locks the check out for
 // everyone for an hour, and a challenge reused or remembered costs nothing.
 // Six per fifteen minutes is more than the site needs (the pool serves play;
 // the slider is only for the Settings account flow), and it cannot run the
 // shared budget dry.
-const PUZZLE_ISSUE_MAX = 6;
-const PUZZLE_ISSUE_WINDOW_MS = 15 * 60 * 1000;
+//
+// 3.1.0 — 6 per 15 minutes was ABOVE Raccoon's real ceiling and is what kept
+// locking the whole site out. Measured: the fifth ask in a short run is answered
+// "Too many puzzle attempts. Please try again in 3543 seconds.", so a budget
+// that allows six guarantees the hour-long block that costs every player their
+// only way back. Three per hour sits below the ceiling with room for a retry.
+// This is deliberately slow: each solved check creates one account that is then
+// reused forever, so the pool is built over hours, not in one sitting.
+const PUZZLE_ISSUE_MAX = 3;
+const PUZZLE_ISSUE_WINDOW_MS = 60 * 60 * 1000;
 // A Raccoon lockout is reported in seconds and can be an hour. Cap what we
 // believe so a nonsense number cannot park the check forever.
 const PUZZLE_BLOCK_MAX_MS = 60 * 60 * 1000;
@@ -491,6 +509,13 @@ export class Hub {
         // ask again and push the window out by another hour.
         const savedPuzzleBlock = await this.storage.get("puzzleBlockedUntil");
         if (typeof savedPuzzleBlock === "number" && savedPuzzleBlock > Date.now()) this.puzzleBlockedUntil = savedPuzzleBlock;
+        // The local allowance has to survive eviction for the same reason, and it
+        // did not until 3.1.0: every deploy handed the new object a fresh window,
+        // so the first few players after a deploy spent six asks in a row and
+        // walked the whole site into Raccoon's hour-long lockout. A deploy is not
+        // permission to ask again.
+        const savedIssues = await this.storage.get("puzzleIssueTimes");
+        if (Array.isArray(savedIssues)) this.puzzleIssueTimes = savedIssues.filter((t) => typeof t === "number" && t > Date.now() - PUZZLE_ISSUE_WINDOW_MS);
         // Puzzle sessions and solved checks have to outlive this object. A
         // Durable Object is evicted when it goes quiet, and the gap between a
         // challenge being handed to a human and that human dragging the slider
@@ -662,6 +687,14 @@ export class Hub {
     // stops a monitor from rediscovering the same hour-long wait.
     const puzzleLeft = this.puzzleBlockRemaining();
     if (puzzleLeft > 0) body.puzzle_blocked_for_seconds = puzzleLeft;
+    // Which gate is shut, and how many asks are left in the local window. Without
+    // this the owner had to guess whether a "limiting human checks" message was
+    // Raccoon's hour-long lockout or our own allowance — they read identically on
+    // screen, and only one of them is worth waiting out.
+    const usedRecently = this.puzzleIssueTimes.filter((t) => t > Date.now() - PUZZLE_ISSUE_WINDOW_MS).length;
+    body.checks_left_this_hour = Math.max(0, PUZZLE_ISSUE_MAX - usedRecently);
+    if (puzzleLeft > 0) body.check_limited_by = "service";
+    else if (usedRecently >= PUZZLE_ISSUE_MAX) body.check_limited_by = "site";
     return { status: reason ? 503 : 200, body };
   }
   // Is this pooled account still able to log in? One authenticated checkCost,
@@ -2139,13 +2172,13 @@ export class Hub {
     // the window, and the old Worker asked on every click.
     const lockedFor = this.puzzleBlockRemaining();
     if (lockedFor > 0) {
-      const out = this.puzzleUnavailable(lockedFor, "The game service is limiting human checks.");
+      const out = this.puzzleUnavailable(lockedFor, "The game service is limiting human checks.", "service");
       return json(out.body, out.status);
     }
     // And no more than the local budget allows, so the shared allowance cannot be
     // spent in one rush and taken away from the next player.
     if (!this.takePuzzleBudget()) {
-      const out = this.puzzleUnavailable(this.puzzleBudgetWait(), "Human checks are busy right now.");
+      const out = this.puzzleUnavailable(this.puzzleBudgetWait(), "This site has used its human checks for this hour.", "site");
       return json(out.body, out.status);
     }
 
@@ -2196,6 +2229,7 @@ export class Hub {
     this.puzzleIssueTimes = this.puzzleIssueTimes.filter((t) => t > now - PUZZLE_ISSUE_WINDOW_MS);
     if (this.puzzleIssueTimes.length >= PUZZLE_ISSUE_MAX) return false;
     this.puzzleIssueTimes.push(now);
+    this.state.waitUntil(this.storage.put("puzzleIssueTimes", this.puzzleIssueTimes).catch(() => {}));
     return true;
   }
   puzzleBudgetWait() {
@@ -2205,7 +2239,13 @@ export class Hub {
   }
   // One response shape for "there is no check available right now", so the site
   // has a single thing to recognise and a player has one thing to read.
-  puzzleUnavailable(seconds, why) {
+  // `limited_by` exists because the two gates are not the same thing and the
+  // owner needs to tell them apart: "service" is Raccoon's own lockout (an hour,
+  // provoked by asking too often) and "site" is this Worker's allowance (three
+  // per hour, by our own choice). They used to share one sentence blaming the
+  // game service, which made our own budget look like an outage we could not
+  // control.
+  puzzleUnavailable(seconds, why, limitedBy = "service") {
     const secs = Math.max(30, Math.ceil(Number(seconds) || 60));
     return {
       status: 200,
@@ -2214,6 +2254,7 @@ export class Hub {
         retry_after_seconds: secs,
         blocked: secs > 120,
         puzzle_blocked: true,
+        limited_by: limitedBy,
       },
     };
   }

@@ -733,6 +733,38 @@ being retried, and a closed tab spending nothing. Section 11 of
 red, one retry happens and the own-account route is shown; section 12 pins the
 legacy fallback.
 
+**3.1.0 — the check's own allowance was causing the lockout it warned about.**
+
+The message *"The game service is limiting human checks for about 15 minutes"*
+showed up on both the free-play offer and Settings → Account, which is correct
+behaviour and a bad number, for three reasons that compound:
+
+- The local allowance was **six asks per 15 minutes**, while Raccoon's own
+  ceiling is about five in a window and its refusal is `Too many puzzle attempts.
+  Please try again in 3543 seconds.` So the budget allowed exactly the run that
+  earns the hour-long block. It is now **three per hour** — deliberately slower
+  than the pool target, because each solved check creates one account that is
+  then reused forever, and three an hour beats a burst followed by an hour of
+  nothing.
+- The allowance was **in memory only**. Every deploy handed the new object a
+  fresh window, so the first few players after a deploy spent the whole budget in
+  a row and walked straight into the lockout. It is persisted now
+  (`puzzleIssueTimes`) and loaded in `ready`.
+- Both gates **shared one sentence that blamed the game service**, including our
+  own budget. `puzzleUnavailable` now returns `limited_by: "service" | "site"`,
+  `/healthz` reports `checks_left_this_hour` and `check_limited_by`, and the site
+  says the true thing: Raccoon's lockout clears by itself, while the site's
+  allowance is a choice we made and reopens gradually.
+
+The modal copy is also neutral now (`app.js?v=20`): it opens from Play *and* from
+Settings, where "press Play again later" was nonsense. Both versions say what a
+check is for — one shared account — and point at the own-account route.
+
+Tests: section 10 of `test_puzzle_cache.mjs` asserts three asks, the `site`
+label, that the allowance is written to storage, and that a revived object still
+honours it. Section 13 of `test_inline_provision.js` pins both sentences and the
+legacy fallback for a Worker without `limited_by`.
+
 ## "I redeployed and nothing changed"
 
 The most common cause is that the new build is not the one being served — an edge
