@@ -650,6 +650,37 @@ check, seeds the account and starts the game. Section 11 of
 `test_puzzle_cache.mjs` checks both halves of `canUnlock` (offered when the
 budget allows it, withheld during a lockout).
 
+**2.9.0 — why the button never appeared, and what replaced the silence.**
+
+The 2.8.0 offer was dead on arrival, and the bug was one layer below the tests
+that covered it: `createSessionAttempt` rebuilt the error event and copied only
+`needVerification`. `capacity`, `canUnlock` and everything else the API sent were
+dropped, so `wantsUnlock` was always false. Every player got the sentence about
+bringing free play back *and a red error with no button* — a week of "free play
+is down" with nothing anyone could press. The tests missed it because they
+stubbed `createSession`, one layer above the mapping. It now goes through
+`sessionEventError()`, and section 10 of `test_inline_provision.js` asserts the
+fields survive.
+
+An empty pool also stops being silent:
+
+- `sessionErrorEvent` always names the two routes that exist — the opt-in check
+  (with the account shared) and "play now with your own game account" — instead
+  of telling people to retry in "a few minutes" into a wall.
+- It adds **`unlockInSeconds`** (`0` when the check is open, otherwise how long
+  until Raccoon's lockout or the local budget window ends), plus `pool` and
+  `poolTarget`. Raccoon allows roughly one check per egress IP per ~20 minutes
+  and every extra ask extends it, so "closed" is the normal state of a busy
+  site.
+- The site shows the offer **with a live countdown** and enables the button when
+  it reaches zero, instead of hiding it (`app.js?v=18`, `style.css?v=13`). A
+  second link, "Or play now with your own account", opens Settings → Account —
+  that route never touches registration, the pool or the shared IP, so it works
+  even when the check does not.
+- A click is honoured as permission even against a 2.8.0 Worker that cannot say
+  whether the check is open, and the puzzle modal no longer repeats the wait
+  twice ("Try again in 47 seconds. Try again in 22s.").
+
 ## "I redeployed and nothing changed"
 
 The most common cause is that the new build is not the one being served — an edge

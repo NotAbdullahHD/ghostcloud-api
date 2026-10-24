@@ -68,10 +68,17 @@ const MAIL_DOMAIN_SCREEN_TTL_MS = 6 * 60 * 60 * 1000;
 // creates one shared account. Raccoon re-gated `sendEmail` behind the check on
 // 2026-10-20 (confirmed from a clean IP, so not an IP flag), which means the
 // automatic path cannot create an account at all until the gate lifts.
-const API_VERSION = "2.8.0";
+// 2.9.0 — an empty pool always names the two real ways back, and says how long
+// the human check is closed for instead of leaving the offer to disappear. The
+// check is scarce (Raccoon allows roughly one attempt per egress IP per ~20
+// minutes, and every extra ask extends that), so "no button" was the normal
+// state of a busy site: players saw a dead end for 20 minutes at a time and
+// nothing ever seeded the pool. `unlockInSeconds` lets the site show the offer
+// with a live countdown, and its own-account route is named in the sentence.
+const API_VERSION = "2.9.0";
 // Capabilities the site probes for. Anything missing means the running Worker is
 // an older build than the site expects.
-const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, optInUnlock: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true };
+const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, optInUnlock: true, unlockCountdown: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true };
 // How many *new* challenges this Worker will ask Raccoon for in a window. Kept
 // well below the observed limit on purpose: a refusal locks the check out for
 // everyone for an hour, and a challenge reused or remembered costs nothing.
@@ -251,7 +258,7 @@ const OUTAGE_MESSAGE = "The game service now asks for a quick human check before
 // pool is filled without one), and sending them to a slider they cannot pass is
 // what produced a 43-minute countdown on a Play button. Nothing on their side is
 // wrong, so the message says that and points at time, not effort.
-const NO_ACCOUNT_MESSAGE = "Every free slot is busy right now and the game service is not opening new accounts this minute. Nothing is wrong on your side \u2014 try again in a few minutes.";
+const NO_ACCOUNT_MESSAGE = "Free play is out of accounts right now: every shared account is in use, and the game service is not opening new ones on its own. Nothing is wrong on your side.";
 // Shown when Raccoon refuses the *address* rather than the human check: it
 // treats the free mail providers' domains as disposable, and no amount of
 // retrying, re-solving or waiting changes that. Naming the provider or quoting
@@ -819,7 +826,19 @@ export class Hub {
       // their own browser. Without it an empty pool is a dead end; with it, one
       // person's check creates an account that every player after them reuses.
       out.canUnlock = this.puzzleAvailable();
-      if (out.canUnlock) out.error = `${out.error} You can also bring free play back yourself \u2014 one quick check, and the account it creates is shared with everyone.`;
+      // When the check is closed, say exactly how long for. Every player who
+      // pressed Play during a 20-minute lockout used to read a sentence about
+      // retrying in "a few minutes" and no way to act on it, which is what an
+      // empty pool looks like from the outside — nothing happens, ever.
+      out.unlockInSeconds = out.canUnlock ? 0 : this.puzzleReopensIn();
+      out.pool = this.pool.length;
+      out.poolTarget = this.POOL_TARGET;
+      if (out.canUnlock) {
+        out.error = `${out.error} You can also bring free play back yourself \u2014 one quick check, and the account it creates is shared with everyone.`;
+      } else {
+        const mins = Math.max(1, Math.ceil(out.unlockInSeconds / 60));
+        out.error = `${out.error} A human check is the only way back, and the game service is limiting those right now \u2014 the next one can be tried in about ${mins} ${mins === 1 ? "minute" : "minutes"}. You can also play right away with your own game account in Settings \u2192 Account.`;
+      }
     }
     return out;
   }
@@ -2010,6 +2029,15 @@ export class Hub {
     if (this.puzzleBlockRemaining() > 0) return false;
     const now = Date.now();
     return this.puzzleIssueTimes.filter((t) => t > now - PUZZLE_ISSUE_WINDOW_MS).length < PUZZLE_ISSUE_MAX;
+  }
+  // Seconds until a player's drag could pass again: Raccoon's own lockout or
+  // this Worker's window, whichever is longer. Zero when the check is open.
+  puzzleReopensIn() {
+    const block = this.puzzleBlockRemaining();
+    const now = Date.now();
+    const used = this.puzzleIssueTimes.filter((t) => t > now - PUZZLE_ISSUE_WINDOW_MS).length;
+    if (used < PUZZLE_ISSUE_MAX) return block;
+    return Math.max(block, this.puzzleBudgetWait());
   }
   notePuzzleBlocked(seconds, why) {
     const secs = Math.min(PUZZLE_BLOCK_MAX_MS / 1000, Math.max(30, Number(seconds) || 0));
