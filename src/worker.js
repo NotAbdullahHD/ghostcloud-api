@@ -97,10 +97,22 @@ const MAIL_DOMAIN_SCREEN_TTL_MS = 6 * 60 * 60 * 1000;
 // allowance, `"service"` for Raccoon's lockout. Those two need different advice
 // and they used to share one sentence that blamed the game service for our own
 // choice.
-const API_VERSION = "3.1.0";
+// 3.2.0 — the way back that needs no check at all. Measured 2026-10-27 against
+// Raccoon directly: `sendEmail` refuses *every* address with "Please complete the
+// puzzle verification." — including domains it is perfectly willing to accept
+// (tmaily.com, duckmail.sbs) — while `emailLogin` takes real credentials and
+// returns a token with no challenge. So the registration gate is not about mail
+// domains and cannot be coded around; what it *is* is per egress IP, which is why
+// a human registering on raccoongame.com from their own connection always
+// succeeds while this Worker, egressing from Cloudflare addresses shared with the
+// whole internet, gets a few checks an hour. `/cloud/v1/manualLogin` is that gap
+// closed: an account made at Raccoon's own site now works here as-is — no
+// mailbox, no provider, no puzzle, no shared budget — and `share` seeds it into
+// the pool, so one hand-made account turns free play back on for everyone.
+const API_VERSION = "3.2.0";
 // Capabilities the site probes for. Anything missing means the running Worker is
 // an older build than the site expects.
-const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, optInUnlock: true, unlockCountdown: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true, queueAll: true, offerOnlyWhenEmpty: true, queueEta: true, checkLimitedBy: true };
+const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, optInUnlock: true, unlockCountdown: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true, queueAll: true, offerOnlyWhenEmpty: true, queueEta: true, checkLimitedBy: true, manualLogin: true };
 // How many *new* challenges this Worker will ask Raccoon for in a window. Kept
 // well below the observed limit on purpose: a refusal locks the check out for
 // everyone for an hour, and a challenge reused or remembered costs nothing.
@@ -319,13 +331,18 @@ const RATE_LIMITED_MESSAGE = "You're going a little fast — give it a few secon
 // spell: every retry gets the same refusal, so telling the player to retry is a
 // lie that also spends quota. Say what is actually true and point at the path
 // that does work — a player's own account skips registration entirely.
-const OUTAGE_MESSAGE = "The game service now asks for a quick human check before it opens an account: one slider puzzle, solved once. Open your account settings, get a mailbox and solve it — after that your games start normally, and so do everyone else's.";
+const OUTAGE_MESSAGE = "The game service now asks for a quick human check before it opens an account: one slider puzzle, solved once. Open your account settings, get a mailbox and solve it — after that your games start normally, and so do everyone else's. If the check is closed for now, sign in there with a game account you already have: signing in never needs one.";
 // What a player gets when *automatic* account creation is refused. They are not
 // asked to solve anything: the automatic path never uses the human check (the
 // pool is filled without one), and sending them to a slider they cannot pass is
 // what produced a 43-minute countdown on a Play button. Nothing on their side is
 // wrong, so the message says that and points at time, not effort.
-const NO_ACCOUNT_MESSAGE = "Free play is out of accounts right now: every shared account is in use, and the game service is not opening new ones on its own. Nothing is wrong on your side.";
+// 3.2.0: it names a way out as well as a cause. "Nothing is wrong on your side"
+// was honest but useless on its own — an empty pool with no check available used
+// to leave the player with a sentence and nowhere to go, which is exactly the
+// complaint it was written to answer. Signing in with an account they already
+// have is the route that works while registration is gated, so it is named here.
+const NO_ACCOUNT_MESSAGE = "Free play is out of accounts right now: every shared account is in use, and the game service is not opening new ones on its own. Nothing is wrong on your side. You can still play: open your account settings and sign in with a game account you already have — that works right now.";
 // Shown when Raccoon refuses the *address* rather than the human check: it
 // treats the free mail providers' domains as disposable, and no amount of
 // retrying, re-solving or waiting changes that. Naming the provider or quoting
@@ -631,6 +648,7 @@ export class Hub {
       case "/cloud/v1/getCode": return this.handleGetCode(ctx);
       case "/cloud/v1/sendEmail": return this.handleSendEmail(ctx);
       case "/cloud/v1/manualRegister": return this.handleManualRegister(ctx);
+      case "/cloud/v1/manualLogin": return this.handleManualLogin(ctx);
       case "/cloud/v1/captchaChallenge": return this.handleCaptchaChallenge(ctx);
       case "/cloud/v1/captchaVerify": return this.handleCaptchaVerify(ctx);
       case "/cloud/v1/seedPool": return this.handleSeedPool(ctx);
@@ -2429,6 +2447,60 @@ export class Hub {
     this.state.waitUntil(this.savePool());
     this.ensureTicking();
     return json({ seeded: true, pool: this.pool.length, target: this.POOL_TARGET });
+  }
+  // ── Sign in with an account the player already has ──────────────────────
+  //
+  // This is the one account route that works while Raccoon's registration gate
+  // is up, and it is the fix for "free play is dead": Raccoon guards every
+  // *registration* with a slider puzzle, but a *login* needs nothing. Verified
+  // 2026-10-27 against Raccoon directly — `sendEmail` answers "Please complete
+  // the puzzle verification." for a perfectly acceptable address (tmaily.com),
+  // while `emailLogin` with real credentials answers a token and no challenge at
+  // all. The puzzle allowance is per *egress IP*, so a human registering on
+  // raccoongame.com from their own connection always succeeds (that is the route
+  // the owner used), whereas this Worker egresses from Cloudflare addresses
+  // shared with the whole internet and can only get a few checks an hour.
+  //
+  // So: anything a player made on Raccoon's own site can be brought here as-is —
+  // no mailbox, no mail provider, no puzzle, no shared budget. With `share` it is
+  // also seeded into the pool, which is how one hand-made account turns free play
+  // back on for everybody.
+  async handleManualLogin(ctx) {
+    const { email, password } = ctx.body || {};
+    if (!email || !password) return json({ error: "Missing email or password." }, 400);
+    // Login takes no verified `sn`, but the call is still made in a session so
+    // the token it returns is bound to the same one the game will launch with.
+    const sn = String((ctx.body || {}).sn || "").trim() || generateSN();
+    const base = { sn, model: "Chrome/147.0.0.0", version_code: "1", version_name: "1.0.0", device_name: "GhostCloud", os: "web" };
+    const headers = {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "User-Agent": BROWSER_UA,
+      ...this.raccoonSessionHeader(sn),
+    };
+    try {
+      const loginRes = await this.raccoonFetch("/users/emailLogin", {
+        method: "POST", headers,
+        body: new URLSearchParams({ email, password, ...base }),
+      });
+      this.captureRaccoonSession(sn, loginRes);
+      const loginData = await parseJsonResponse(loginRes, "Raccoon login");
+      if (loginData.status !== 200) {
+        // Raccoon's own sentence, not a generic one: "wrong password" and "no
+        // such account" are things the player can act on, and a bare "login
+        // failed" is what hid them before.
+        const why = loginData.msg || "The game service refused that email and password.";
+        console.log(`manualLogin refused for ${email}: ${why}`);
+        return json({ error: why, raccoon: loginData, needVerification: this.isRaccoonWall(why) }, 400);
+      }
+      // The token arrives both ways depending on the edge node; prefer the cookie
+      // when it is there, exactly as the register path does.
+      let userToken = loginData.data?.user_token || "";
+      const cookie = loginRes.headers.get("set-cookie");
+      if (cookie) { const m = cookie.match(/as_user_token=([^;]+)/); if (m) userToken = m[1]; }
+      if (!userToken) return json({ error: "The game service accepted the login but returned no token." }, 502);
+      console.log(`manualLogin ok for ${email}`);
+      return json({ sn, token: userToken, email });
+    } catch (e) { return json({ error: e.message }, 500); }
   }
   async handleManualRegister(ctx) {
     const { sn, email, password, code, phone, country } = ctx.body || {};

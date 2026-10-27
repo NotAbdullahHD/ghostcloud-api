@@ -765,6 +765,54 @@ label, that the allowance is written to storage, and that a revived object still
 honours it. Section 13 of `test_inline_provision.js` pins both sentences and the
 legacy fallback for a Worker without `limited_by`.
 
+**3.2.0 — the way in that needs no check at all.**
+
+The owner registered at raccongame.com by hand and the game loaded straight
+after a short queue, while this site stayed empty. That is the whole clue, and
+re-probed directly on 2026-10-27 it says exactly which half is broken:
+
+| Probe (from this machine, 2026-10-27) | Answer |
+|---|---|
+| `emailRegister` for `@tmaily.com`, junk code | `400 Human verification is required. Please request a new email code.` |
+| `emailRegister` for `@duckmail.sbs`, junk code | same — so **duckmail is not blocked** |
+| `emailRegister` for `@mail.gw` / `@niceground.shop` | `400 Temporary email addresses are not supported.` |
+| `sendEmail` for a fresh, acceptable address | `400 Please complete the puzzle verification.` |
+| `emailLogin` with real credentials | **a token, and no challenge at all** |
+
+Two things fall out of that. First, the gate was never about mail domains —
+`sendEmail` refuses even an address Raccoon is happy to accept, so no provider
+swap and no amount of lane rotation can get an account made unattended. Second
+and more usefully: **registration needs a human; logging in needs nothing.**
+
+The check allowance is per *egress IP*. A player registering at Raccoon's own
+site from their own connection has their own allowance and always succeeds — that
+is why the owner's manual test worked. This Worker egresses from Cloudflare
+addresses shared with the whole internet, so its allowance is tiny and shared:
+that is the entire reason the pool cannot refill itself.
+
+So the fix is not to defeat the gate but to stop depending on it:
+
+- **`POST /cloud/v1/manualLogin`** `{email, password}` → Raccoon `emailLogin` →
+  `{sn, token, email}`. No mailbox, no mail provider, no puzzle, no shared
+  budget. An account a player made at raccongame.com works here as-is, and the
+  token is the same shape `Play` already saves, so nothing else had to change.
+- The site (Settings → Account, `app.js?v=21`) gained **"Use an account you
+  already have"** with a *Share it with everyone* switch. On, it seeds the
+  account into the pool via the existing `seedPool`, which is what turns one
+  hand-made account into free play for everybody; off, the account is simply the
+  player's. A share the pool refuses (usually because it is full) is reported as
+  exactly that, never as a success.
+- `NO_ACCOUNT_MESSAGE` and `OUTAGE_MESSAGE` now name that destination instead of
+  ending on "Nothing is wrong on your side" with nothing to press.
+
+Tests: `test_verification_visibility.js` §13–15 pin that a sign-in reaches
+`emailLogin` and nothing else (no captcha, no `sendEmail`, no `emailRegister`),
+that a refusal passes Raccoon's own reason through without starting a cooldown,
+and that the token is read from the cookie when it lands there. §14 of
+`test_inline_provision.js` drives the real `signInExistingAccount()` — the account
+is saved where `Play` reads it, the switch seeds it, an unshared sign-in seeds
+nothing, and a refused one saves nothing.
+
 ## "I redeployed and nothing changed"
 
 The most common cause is that the new build is not the one being served — an edge
