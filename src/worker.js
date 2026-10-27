@@ -2488,8 +2488,17 @@ export class Hub {
         // Raccoon's own sentence, not a generic one: "wrong password" and "no
         // such account" are things the player can act on, and a bare "login
         // failed" is what hid them before.
-        const why = loginData.msg || "The game service refused that email and password.";
-        console.log(`manualLogin refused for ${email}: ${why}`);
+        let why = loginData.msg || "The game service refused that email and password.";
+        // "Please register first" is Raccoon's answer for an address it has no
+        // account for (measured 2026-10-27, returned with HTTP 429), and it reads
+        // as an instruction to go and register here — the one thing that is
+        // closed. It means "that email is not an account": say so, and name the
+        // place where an account *can* still be made, without a provider name or a
+        // hostname in the sentence (see the leak assertions in the tests).
+        if (/register first|no such|not exist|no account/i.test(why)) {
+          why = "There is no game account for that email. Check the address \u2014 or make an account on the game\u2019s own website, where the check is yours to solve, and sign in with it here.";
+        }
+        console.log(`manualLogin refused for ${email}: ${loginData.msg}`);
         return json({ error: why, raccoon: loginData, needVerification: this.isRaccoonWall(why) }, 400);
       }
       // The token arrives both ways depending on the edge node; prefer the cookie
