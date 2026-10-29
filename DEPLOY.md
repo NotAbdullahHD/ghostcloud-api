@@ -906,8 +906,50 @@ out `ACCOUNT_SLOT_WAIT_MS` (6 min) for an account that was never coming.
 
 The effect is that a dead pool costs a player a sentence, not six minutes of
 line. It does not by itself create accounts — that still needs the check or a
-player's own account — which is why the wording names both.
-
-Verified with a Hub-level check of the event (`noAccounts`, the honest sentence,
-the wall countdown, the healthy-pool and manual-path cases) plus the existing
+player's own account — which is why the wording names both.Verified with a Hub-level check of the event (`noAccounts`, the honest sentence,
+ the wall countdown, the healthy-pool and manual-path cases) plus the existing
 `test_verification_visibility.js` and `test_raccoon_wall.js`.
+
+**3.2.2 — the pool was empty because no mailbox can be made at all.** `/diagMail`
+on 2026-10-29, live: `tempmail.lol` HTTP 429, `api.duckmail.sbs` *every domain*
+refused with "Temporary email addresses are not supported.", `api.mail.gw` HTTP
+521, `ownDomain: (not configured)`, and Raccoon's own `sendEmail` answering
+"Please complete the puzzle verification." (`walled: true`). Three separate
+failures, none of them the "busy" the player was shown.
+
+The domain question is now closed empirically: `maxxspace.com` (mail.tm),
+`sharklasers.com` and `guerrillamail.com` (Guerrilla Mail) all answer the same
+domain refusal, so **no free provider can ever work again**. A registration code
+needs a domain whose reputation Raccoon has not retired — the own-domain lane,
+or an account the player already has.
+
+- **`mailRouteDead()`** — no own domain, and every lane has failed at least five
+  times without one success. A lane that has never been tried does not count as
+  dead (a cold start is not proof of failure).
+- **`createMailbox` names the route.** When every lane throws and the route is
+  dead it answers `MAIL_REFUSED_MESSAGE` with `needOwnAccount: true`, instead of
+  `BUSY_MESSAGE` ("try again in a moment") for a condition no retry can change.
+- **No check is spent on an undeliverable address.** `captchaChallenge` refuses
+  before `takePuzzleBudget()`, because a solve whose code can never arrive costs
+  one of the three hourly checks every other player shares.
+- **`/healthz` says `mail_lanes_dead`** and reports `mail_route:
+  own_domain|dead|free_lanes`. `pool_fill_failing` was true but useless: it
+  pointed at the fill loop, not at the dead providers.
+
+What actually restores free play, in order of effort:
+
+1. **Sign in with an account you already have** (works today, no infra). Raccoon
+   gates registration, not login; `manualLogin` + the share switch seeds it into
+   the pool, and `GHOSTCLOUD_REUSE_ACCOUNTS` keeps that account serving players
+   afterwards.
+2. **Own-domain lane** — any domain (~$10/yr), Cloudflare Email Routing catch-all
+   → the Email Worker, then `GHOSTCLOUD_MAIL_DOMAIN` + `GHOSTCLOUD_INBOUND_KEY`.
+   The code is pushed straight into the Worker, so no provider outage and no
+   blocklist can stop it. Each human solve then creates a reusable pooled account
+   (three an hour at most, and reuse means they are not re-registered).
+
+Verified on the built file with a Hub-level check of `mailRouteDead`, the health
+reason, the mailbox answer, the challenge refusal (and that it spends no budget),
+plus `test_puzzle_cache.mjs` (which also asserts the opt-in unlock offer is
+still made), `test_raccoon_wall.js`, `test_account_reuse.js` and
+`test_verification_visibility.js`.

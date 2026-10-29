@@ -109,7 +109,7 @@ const MAIL_DOMAIN_SCREEN_TTL_MS = 6 * 60 * 60 * 1000;
 // closed: an account made at Raccoon's own site now works here as-is — no
 // mailbox, no provider, no puzzle, no shared budget — and `share` seeds it into
 // the pool, so one hand-made account turns free play back on for everyone.
-const API_VERSION = "3.2.1";
+const API_VERSION = "3.2.2";
 // Capabilities the site probes for. Anything missing means the running Worker is
 // an older build than the site expects.
 const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, optInUnlock: true, unlockCountdown: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true, queueAll: true, offerOnlyWhenEmpty: true, queueEta: true, checkLimitedBy: true, manualLogin: true };
@@ -685,12 +685,33 @@ export class Hub {
   // become the outage.
   // Deliberately terse: it is a public URL, and "which lane is throttled" is
   // what diagMail is for.
+  // Is there any way at all to receive a registration code right now?
+  //
+  // The own-domain lane is the only durable route: the code is pushed straight
+  // into this Worker, so neither a provider outage nor Raccoon's domain blocklist
+  // can touch it. The free lanes are a different story — measured live on
+  // 2026-10-29, tempmail.lol answered 429, duckmail.sbs had *every* domain
+  // refused as "Temporary email addresses are not supported", and mail.gw was
+  // 521. While every lane looks like that, "try again in a moment" is a lie: no
+  // retry produces a mailbox, and the only route left is the player's own
+  // account. A fresh lane that has never been tried is not proof of life, but it
+  // is not proof of death either, so only repeated failures count.
+  mailRouteDead() {
+    if (this.MAIL_DOMAIN) return false;
+    const lanes = this.allLanes();
+    if (!lanes.length) return true;
+    return lanes.every((l) => {
+      const st = this.providerStats.get(l.id);
+      return !!st && (st.fail || 0) >= 5 && !(st.ok > 0);
+    });
+  }
   healthReport() {
     const pool = this.pool.length;
     const wallLeftMs = Math.max(0, this.raccoonWalledUntil - Date.now());
     let reason = null;
     if (pool === 0) {
       if (wallLeftMs > 0) reason = "registration_walled";
+      else if (this.mailRouteDead()) reason = "mail_lanes_dead";
       else if (this.poolFillFails >= 3) reason = "pool_fill_failing";
     }
     const body = { status: reason ? "degraded" : "ok", name: "ghostcloud-api", apiVersion: API_VERSION };
@@ -700,6 +721,9 @@ export class Hub {
     // reporting even when the answer is "ok".
     body.pool = pool;
     body.pool_target = this.POOL_TARGET;
+    // Which mail route exists, so the operator can tell a provider outage from a
+    // site that has no way to receive a code at all (see mailRouteDead).
+    body.mail_route = this.MAIL_DOMAIN ? "own_domain" : (this.mailRouteDead() ? "dead" : "free_lanes");
     // A locked-out human check is not an outage — play still works from the pool
     // — but it is the first thing to look at when registrations stop, and it
     // stops a monitor from rediscovering the same hour-long wait.
@@ -2142,6 +2166,11 @@ export class Hub {
     // Every usable domain is refused: that is a known, actionable situation, not
     // "we are busy" — so it says so instead of quoting a provider or Raccoon.
     if (!lastErr) return json({ error: MAIL_REFUSED_MESSAGE, needOwnAccount: true }, refusedDomain ? 503 : 500);
+    // Every lane threw. When they have all been failing for a while this is not a
+    // busy spell to retry through — name the route that still works instead of
+    // sending the player back to a button that produces the same answer.
+    if (this.mailRouteDead()) return json({ error: MAIL_REFUSED_MESSAGE, needOwnAccount: true }, 503);
+
     if (refusedDomain) console.log(`createMailbox: at least one domain was refused (last error: ${lastErr.message})`);
     return json({ error: playerMessage(lastErr) }, 500);
   }
@@ -2216,6 +2245,13 @@ export class Hub {
     if (lockedFor > 0) {
       const out = this.puzzleUnavailable(lockedFor, "The game service is limiting human checks.", "service");
       return json(out.body, out.status);
+    }
+    // No mailbox, no code, so no point in a drag. This sits in front of the
+    // budget because a check spent on an undeliverable address is a check taken
+    // from every other player this hour: the answer would be "no mailbox" at the
+    // end of it. The site turns `needOwnAccount` into the route that works.
+    if (this.mailRouteDead()) {
+      return json({ error: MAIL_REFUSED_MESSAGE, needOwnAccount: true, canUnlock: false, blocked: true }, 503);
     }
     // And no more than the local budget allows, so the shared allowance cannot be
     // spent in one rush and taken away from the next player.
