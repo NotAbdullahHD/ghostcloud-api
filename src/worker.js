@@ -109,7 +109,7 @@ const MAIL_DOMAIN_SCREEN_TTL_MS = 6 * 60 * 60 * 1000;
 // closed: an account made at Raccoon's own site now works here as-is — no
 // mailbox, no provider, no puzzle, no shared budget — and `share` seeds it into
 // the pool, so one hand-made account turns free play back on for everyone.
-const API_VERSION = "3.2.0";
+const API_VERSION = "3.2.1";
 // Capabilities the site probes for. Anything missing means the running Worker is
 // an older build than the site expects.
 const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, optInUnlock: true, unlockCountdown: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true, queueAll: true, offerOnlyWhenEmpty: true, queueEta: true, checkLimitedBy: true, manualLogin: true };
@@ -942,7 +942,16 @@ export class Hub {
       // were the same flag until 3.0.0, which is why a throttle during a busy
       // minute put a captcha button in front of somebody whose real problem was
       // a 429 that no amount of dragging could clear.
-      out.noAccounts = !!autoWall;
+      // An empty pool is a dead end whatever the refusal was: there is no
+      // account to hand out and the automatic path cannot make one. `noAccounts`
+      // is the label the site turns into the human check, so it has to be true
+      // here even when the reason was congestion — six minutes in a line that
+      // ended in "we're at our busiest" was the same dead end told as a busy
+      // spell, and it is why the queue seemed endless with nobody playing.
+      const wallLeft = Math.max(0, this.raccoonWalledUntil - Date.now());
+      const deadEnd = this.pool.length === 0 && (wallLeft > 0 || this.poolFillFails >= 3);
+      out.noAccounts = !!autoWall || deadEnd;
+      if (out.noAccounts) out.error = NO_ACCOUNT_MESSAGE;
       out.pool = this.pool.length;
       out.poolTarget = this.POOL_TARGET;
       const left = Math.ceil(Math.max(0, this.raccoonWalledUntil - Date.now()) / 1000);
@@ -1841,7 +1850,12 @@ export class Hub {
       } catch (e) {
         if (w.ended) return null;
         const wall = !!(e && e.raccoonWall) || this.isRaccoonWall(e && e.message);
-        if (wall || round >= ACCOUNT_RETRY_ROUNDS) throw e;
+        // Retrying three times (≈70s of gaps) only helps when a retry could
+        // actually find an account. With the pool empty and the fills failing it
+        // cannot, so the cost is a held registration slot for every player
+        // behind this one.
+        const poolDeadEnd = this.pool.length === 0 && this.poolFillFails >= 3 && !this.poolFilling;
+        if (wall || poolDeadEnd || round >= ACCOUNT_RETRY_ROUNDS) throw e;
         const wait = Math.min(ACCOUNT_RETRY_BACKOFF_MS[round] ?? 40000, Math.max(0, e?.retryAfterMs || 0) || 40000);
         round++;
         console.log(`account attempt failed for ${String(w.sessionUuid || "?").slice(0, 8)} (${e.message}) — retry ${round}/${ACCOUNT_RETRY_ROUNDS} in ${Math.round(wait / 1000)}s`);
@@ -1915,6 +1929,16 @@ export class Hub {
         // never trips and the player sees a line instead of an error.
         // `creating_account` is only sent once a slot is actually held: while
         // waiting, the player is told they are in line, which is the truth.
+        // A line that cannot move is not kindness. With an empty pool and the
+        // last fills all failing, no registration slot will ever help: the
+        // attempt fails, and the player who waited six minutes reads "we're at
+        // our busiest". Answer at once with the honest label instead, so the
+        // site can offer the one thing that does help — a human check, or the
+        // player's own account. `poolFilling` is excluded because a fill in
+        // flight may still succeed and refill the pool mid-request.
+        if (this.pool.length === 0 && this.poolFillFails >= 3 && !this.poolFilling) {
+          throw Object.assign(new Error("free play has no accounts to hand out"), { busy: true, auto: true });
+        }
         if (!(await this.waitForAccountSlot(w))) {
           if (w.ended) return;
           throw Object.assign(new Error("no registration slot free in time"), { busy: true });

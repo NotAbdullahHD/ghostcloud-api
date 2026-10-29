@@ -883,3 +883,31 @@ of guessing:
    still means accounts are created from one shared egress address at whatever
    rate players solve puzzles. If Raccoon tightens that limit, the honest answer
    is an official arrangement with them rather than a cleverer relay.
+
+**3.2.1 — an empty pool answers now instead of after six minutes.** Reproduced
+live on 2026-10-29 with the pool at 0: one Play request sat at `#10` in the
+`account_setup` line, reached the front after **364 seconds**, and was answered
+with "We're at our busiest right now…" — `needVerification: false`, no
+`noAccounts`, and nothing to click. The cause was not the queue being slow but
+the queue being pointless: with the pool empty and every fill failing, the two
+registration slots are held by attempts that cannot succeed, so the player waits
+out `ACCOUNT_SLOT_WAIT_MS` (6 min) for an account that was never coming.
+
+- **The slot timeout is labelled.** `waitForAccountSlot`'s failure threw
+  `{busy: true}` without `auto`, so `sessionErrorEvent` treated it as a generic
+  congestion and printed `BUSY_MESSAGE`. It now carries `auto`, and with an
+  empty pool that is not being refilled (`poolFillFails >= 3` or a wall) the
+  event says `noAccounts: true` with `NO_ACCOUNT_MESSAGE` — the label the site
+  turns into the human check. A healthy pool keeps the busy wording.
+- **The doomed wait is skipped.** Before `waitForAccountSlot`, an empty pool
+  with failing fills answers at once, and `createAccountWithRetries` no longer
+  spends three rounds (~70s of gaps) finding out what the fill loop already
+  knows. `poolFilling` is excluded: a fill in flight may still succeed.
+
+The effect is that a dead pool costs a player a sentence, not six minutes of
+line. It does not by itself create accounts — that still needs the check or a
+player's own account — which is why the wording names both.
+
+Verified with a Hub-level check of the event (`noAccounts`, the honest sentence,
+the wall countdown, the healthy-pool and manual-path cases) plus the existing
+`test_verification_visibility.js` and `test_raccoon_wall.js`.
