@@ -541,6 +541,7 @@ and then stopped resolving at all, `duckmail.sbs` refused *every* domain, and
 | Guerrilla Mail | guerrillamailblock, grr.la, spam4.me, pokemail.net, guerrillamail.info | blocked |
 | Dropmail | 10mail.org, emlhub, emlpro, emltmp | blocked |
 | yopmail, maildrop, mailnesia, moakt, emailondeck, mailto.plus, fexpost, fexbox, mailinator, getnada, discard.email, temp-mail.org, tempail, throwawaymail, mailcatch, spambog, 1secmail, wwjmp | one each | blocked |
+| grabmail.io | grabmail.io / mixozia.com / linqmail.com | grabmail.io blocked, **the other two accepted** |
 | gmail.com, outlook.com | control | **accepted** |
 
 The control matters: it proves the *method* works, so these are genuine domain
@@ -577,6 +578,31 @@ bearing:
    inbox could be quoted back as this registration's code — verified present in a
    recycled inbox during the sweep.
 
+**A second lane, from the same sweep.** `grabmail.io` is also keyless, and its own
+`/api/v1/domains` answer calls the public domains blocklisted — *"Many signup
+forms reject them, and changing the local part does not help."* Measured, that is
+half true: `@grabmail.io` is refused, but `@mixozia.com` and `@linqmail.com` are
+accepted. So `grabmailLane` asks the provider for its domain list, screens what it
+is given, and hands out whichever one Raccoon takes — it never trusts the
+provider's own warning, and it never trusts ours either. Two independent keyless
+providers mean one service going down or rate-limiting us no longer empties the
+mail route on its own. `GHOSTCLOUD_GRABMAIL=off` removes it.
+
+An inbox needs no creation call (any address on those domains is one) and reads
+keylessly: `GET /api/v1/mailbox?address=` → `GET /api/v1/message/<id>?mailbox=`.
+Because the local part is random per player, no two registrations share an inbox —
+the cross-reading problem emailnator's recycled accounts can have does not apply
+here, and the `since` filter is belt-and-braces rather than the only defence.
+Grabmail also offers the durable route for free if a domain ever exists: point
+the MX at `smtp.grabmail.io` and every address on it is an inbox.
+
+Worth knowing, both were measured and neither was taken up: `smailpro.com` sells
+access to a pool of ~3,000 real Gmail and ~11,000 Outlook inboxes with an API key
+(1 credit per inbox, $1 per 1,000 credits) — that would also pass the screen, and
+it is the paid fallback if both free lanes ever die. Grabmail's *premium* pool (97
+private `.com` domains kept off disposable lists) is $12.99/month and needs no
+code from us: it only changes which domains exist to screen.
+
 **What this does and does not restore.** It restores the *mailbox*, not the human
 check: Raccoon still demands a solved puzzle for every code, on a clean IP too
 (`gmail.com` gets "Human verification is required", not a free pass). So the
@@ -591,7 +617,14 @@ in the rotation and its mailbox survives `createMailbox`, gmail.com is actually
 screened and accepted rather than skipped, a stale code is never quoted back, only
 the newest three messages are opened, one retired `ids` value does not kill the
 lane, all of them failing reports a failure naming no provider, and the env switch
-removes it.
+removes it. `.freebuff/test_grabmail_lane.js` (12 assertions) holds the same
+invariants for the second lane, plus the one that matters most for it: a domain
+the screen refuses is retired and never handed to a player, even though the
+provider itself lists it as usable.
+
+Both lanes are live probes, not mocks: `node .freebuff/probe_emailnator_live.mjs`
+and `node .freebuff/probe_grabmail_live.mjs` call `createMailbox` against the real
+providers and the real `emailRegister` screen.
 
 ## "Try again in X seconds" — the check's own rate limit
 

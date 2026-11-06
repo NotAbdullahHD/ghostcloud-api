@@ -55,6 +55,9 @@ GHOSTCLOUD_MAIL_PROVIDERS = "https://api.duckmail.sbs,https://api.mail.gw"
 # receive a registration code while every temp-mail domain is blocklisted.
 # Unset = on; set to "off" to remove the lane. See DEPLOY.md (3.2.3).
 # GHOSTCLOUD_EMAILNATOR = "off"
+# A second keyless lane (mixozia.com / linqmail.com, both accepted by the screen),
+# from a different provider so one outage cannot empty the mail route. Unset = on.
+# GHOSTCLOUD_GRABMAIL = "off"
 # After Raccoon's bot wall is seen, stop attempting registrations for this long
 # (ms). Retrying cannot pass the wall and only spends provider quota plus the
 # free plan's 100k/day Durable Object budget, so a walled hub now costs one alarm

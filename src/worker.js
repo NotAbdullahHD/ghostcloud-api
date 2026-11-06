@@ -109,7 +109,7 @@ const MAIL_DOMAIN_SCREEN_TTL_MS = 6 * 60 * 60 * 1000;
 // closed: an account made at Raccoon's own site now works here as-is — no
 // mailbox, no provider, no puzzle, no shared budget — and `share` seeds it into
 // the pool, so one hand-made account turns free play back on for everyone.
-const API_VERSION = "3.2.3";
+const API_VERSION = "3.2.4";
 // Capabilities the site probes for. Anything missing means the running Worker is
 // an older build than the site expects.
 const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, optInUnlock: true, unlockCountdown: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true, queueAll: true, offerOnlyWhenEmpty: true, queueEta: true, checkLimitedBy: true, manualLogin: true };
@@ -452,6 +452,9 @@ export class Hub {
     // -domain screen accepts where every temp-mail domain is refused; see the
     // lane for the measurements. Kept switchable in case the service goes.
     this.EMAILNATOR_ENABLED = env.GHOSTCLOUD_EMAILNATOR !== "off";
+    // Second keyless lane, deliberately a different provider from emailnator so
+    // one service's outage or rate limit cannot take mail down on its own.
+    this.GRABMAIL_ENABLED = env.GHOSTCLOUD_GRABMAIL !== "off";
     this.TEMPMAILLOL_ENABLED = env.GHOSTCLOUD_TEMPMAILLOL !== "off";
     this.PRO_CODE = env.GHOSTCLOUD_PRO_CODE || "";
     this.PRO_EPOCH = env.GHOSTCLOUD_PRO_EPOCH || "1";
@@ -1202,6 +1205,52 @@ export class Hub {
       },
     };
   }
+  // grabmail.io — a second keyless lane, independent of emailnator.
+  //
+  // Its own `/api/v1/domains` answer describes the public domains as blocklisted
+  //("Many signup forms reject them") — measured 2026-11-06, that is true of
+  // grabmail.io itself, but **mixozia.com and linqmail.com are accepted** by
+  // Raccoon's screen. So the lane does not trust the provider's own warning (or
+  // ours): it asks `/api/v1/domains`, screens what it is given, and lets the
+  // existing blocklist retire whichever domain stops working.
+  //
+  // An inbox needs no creation call — every address on one of those domains is
+  // an inbox — and `GET /api/v1/mailbox?address=` reads it without a key. The
+  // local part is random per player, so two registrations cannot read each
+  // other's code the way a recycled inbox would allow.
+  //   GET /api/v1/mailbox?address=<addr>          → { messages: [{ id, subject, … }] }
+  //   GET /api/v1/message/<id>?mailbox=<addr>     → { html | text }
+  get grabmailLane() {
+    const base = "https://grabmail.io/api/v1";
+    const self = this;
+    return {
+      id: "grabmail.io",
+      create: async () => {
+        const data = await parseJsonResponse(await fetchWithTimeout(`${base}/domains`, {}, 20000), "Account service");
+        const domains = (data.public || []).filter((d) => d && !self.blockedMailDomains.has(d));
+        if (!domains.length) throw new Error("all of its domains are blocklisted by Raccoon");
+        // The most recently added domain is the least likely to be on anyone's
+        // list, which is the only reason to prefer it over random choice.
+        const email = `rcn_${Math.random().toString(36).substring(2, 11)}@${domains[domains.length - 1]}`;
+        return { email, handle: { lane: "grabmail", email, since: Math.floor(Date.now() / 1000) - 120 } };
+      },
+      read: async (handle) => {
+        const box = await parseJsonResponse(await fetchWithTimeout(
+          `${base}/mailbox?address=${encodeURIComponent(handle.email)}`, {}, 20000), "Mail service");
+        const stamp = (m) => Number(m.ts ?? m.ts_ms ?? m.date ?? m.created_at ?? m.received_at ?? 0);
+        const msgs = (box.messages || [])
+          .filter((m) => { const t = stamp(m); return !t || t >= (handle.since || 0); })
+          .sort((a, b) => stamp(b) - stamp(a));
+        for (const m of msgs.slice(0, 3)) {
+          const full = await parseJsonResponse(await fetchWithTimeout(
+            `${base}/message/${encodeURIComponent(m.id)}?mailbox=${encodeURIComponent(handle.email)}`, {}, 20000), "Mail service");
+          const code = codeFromText([full.html, full.text, full.body, full.subject, m.subject].filter(Boolean).join("\n"));
+          if (code) return code;
+        }
+        return null;
+      },
+    };
+  }
   mailtmLane(base) {
     const self = this;
     return {
@@ -1243,6 +1292,7 @@ export class Hub {
     const d = this.domainLane;
     if (d) lanes.push(d);
     if (this.EMAILNATOR_ENABLED) lanes.push(this.emailnatorLane);
+    if (this.GRABMAIL_ENABLED) lanes.push(this.grabmailLane);
     if (this.TEMPMAILLOL_ENABLED) lanes.push(this.tempmailLolLane);
     this.MAIL_PROVIDERS.forEach((b) => lanes.push(this.mailtmLane(b)));
     return lanes;
@@ -2252,6 +2302,7 @@ export class Hub {
     const body = ctx.body || {};
     let lane = null;
     if (body.lane === "emailnator" && body.email) lane = this.emailnatorLane;
+    else if (body.lane === "grabmail" && body.email) lane = this.grabmailLane;
     else if (body.lane === "tempmail.lol" && body.mailToken) lane = this.tempmailLolLane;
     else if (body.lane === "domain" && body.email && this.domainLane) lane = this.domainLane;
     else if (body.lane === "mailtm" || (!body.lane && body.mailJwt)) {
