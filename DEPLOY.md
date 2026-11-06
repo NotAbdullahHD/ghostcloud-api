@@ -524,6 +524,75 @@ blocked keeps growing (`diagMail` → `blockedDomains`). The durable answer is s
 the own-domain lane (`GHOSTCLOUD_MAIL_DOMAIN` + `GHOSTCLOUD_INBOUND_KEY`), which
 does not depend on anyone else's domains at all.
 
+## The provider sweep, and the one lane that still works (3.2.3)
+
+By 2026-11-06 every free lane was dead at once: `tempmail.lol` returned HTTP 429
+and then stopped resolving at all, `duckmail.sbs` refused *every* domain, and
+`mail.gw` answered HTTP 521. The question that followed was the obvious one —
+*can we just find a fresh provider?* — so it was measured rather than assumed.
+
+**38 domains across 15 providers, screened with `screenMailDomain`'s own call**
+(`/users/emailRegister`, junk code, no session):
+
+| provider | domains tested | result |
+|---|---|---|
+| temp-mail.io | all 7 it was rotating (olipii, yzcalo, lnovic, ruutukf, gmeenramy, ooynib, tanpony) | every one blocked |
+| mail.tm | maxxspace.com | blocked |
+| Guerrilla Mail | guerrillamailblock, grr.la, spam4.me, pokemail.net, guerrillamail.info | blocked |
+| Dropmail | 10mail.org, emlhub, emlpro, emltmp | blocked |
+| yopmail, maildrop, mailnesia, moakt, emailondeck, mailto.plus, fexpost, fexbox, mailinator, getnada, discard.email, temp-mail.org, tempail, throwawaymail, mailcatch, spambog, 1secmail, wwjmp | one each | blocked |
+| gmail.com, outlook.com | control | **accepted** |
+
+The control matters: it proves the *method* works, so these are genuine domain
+refusals and not a broken probe. temp-mail.io rotates freshly created domains and
+**all seven** were already on the list — so a new provider does not help. Raccoon's
+blocklist is live, not a stale snapshot, and it is sourced from the public
+disposable-domain lists that a new provider joins the moment it has users.
+
+**The exception is not a temp-mail provider at all.** `emailnator.com` hands out
+real Gmail plus-addresses on accounts it maintains — so the *domain* is
+`gmail.com`, which is accepted. Free, no API key, no signup:
+
+```
+POST https://www.emailnator.com/api/generate-email  {"ids":[2]}   → ac134899+d539h@gmail.com
+POST https://www.emailnator.com/api/message-list     {email, limit}
+GET  https://www.emailnator.com/api/message/{id}                  → {content: "<html>…"}
+```
+
+`ids` from the site's own client: `2` = plus-gmail, `3` = dot-gmail, `8` =
+`@googlemail.com`. All three shapes screen as accepted. That is `emailnatorLane`,
+and `GHOSTCLOUD_EMAILNATOR=off` removes it.
+
+Two properties of the service shaped the implementation, and both are load
+bearing:
+
+1. **Inboxes are public.** Anyone who knows an address can read it. That is
+   acceptable only because a code lives ~2 minutes and is worthless once the
+   account exists with our password — and it is why this lane creates accounts and
+   holds nothing else. It is *not* a place for a player's own credentials.
+2. **Inboxes are recycled.** The list endpoint is per-address and a fresh alias
+   starts empty, but the service keeps everyone's mail, so `read()` carries the
+   mailbox's creation time (`since`) and ignores anything older. Without it, a
+   stranger's old "[Berriz] This is your verification code" sitting in the same
+   inbox could be quoted back as this registration's code — verified present in a
+   recycled inbox during the sweep.
+
+**What this does and does not restore.** It restores the *mailbox*, not the human
+check: Raccoon still demands a solved puzzle for every code, on a clean IP too
+(`gmail.com` gets "Human verification is required", not a free pass). So the
+pool refills from human solves at up to 3/hour, and `GHOSTCLOUD_REUSE_ACCOUNTS`
+makes each solved account serve many sessions instead of being re-registered.
+The own-domain lane (`GHOSTCLOUD_MAIL_DOMAIN`) is still the only route that does
+not depend on a third party at all, and it makes each solve cheaper to turn into
+an account — but it is no longer the only way for a player to get in.
+
+Guarded by `.freebuff/test_emailnator_lane.js` (16 assertions): the lane appears
+in the rotation and its mailbox survives `createMailbox`, gmail.com is actually
+screened and accepted rather than skipped, a stale code is never quoted back, only
+the newest three messages are opened, one retired `ids` value does not kill the
+lane, all of them failing reports a failure naming no provider, and the env switch
+removes it.
+
 ## "Try again in X seconds" — the check's own rate limit
 
 Raccoon rate-limits puzzle attempts per window (`429 Too many puzzle attempts`,

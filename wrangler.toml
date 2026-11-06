@@ -50,6 +50,11 @@ GHOSTCLOUD_POOL_TARGET = "10"
 GHOSTCLOUD_REUSE_ACCOUNTS = "on"
 # Comma-separated mail.tm-shaped fallback providers (optional).
 GHOSTCLOUD_MAIL_PROVIDERS = "https://api.duckmail.sbs,https://api.mail.gw"
+# emailnator.com hands out real @gmail.com aliases, the one domain Raccoon's
+# disposable-domain screen accepts — so this is the lane that can actually
+# receive a registration code while every temp-mail domain is blocklisted.
+# Unset = on; set to "off" to remove the lane. See DEPLOY.md (3.2.3).
+# GHOSTCLOUD_EMAILNATOR = "off"
 # After Raccoon's bot wall is seen, stop attempting registrations for this long
 # (ms). Retrying cannot pass the wall and only spends provider quota plus the
 # free plan's 100k/day Durable Object budget, so a walled hub now costs one alarm

@@ -109,7 +109,7 @@ const MAIL_DOMAIN_SCREEN_TTL_MS = 6 * 60 * 60 * 1000;
 // closed: an account made at Raccoon's own site now works here as-is — no
 // mailbox, no provider, no puzzle, no shared budget — and `share` seeds it into
 // the pool, so one hand-made account turns free play back on for everyone.
-const API_VERSION = "3.2.2";
+const API_VERSION = "3.2.3";
 // Capabilities the site probes for. Anything missing means the running Worker is
 // an older build than the site expects.
 const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, optInUnlock: true, unlockCountdown: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true, queueAll: true, offerOnlyWhenEmpty: true, queueEta: true, checkLimitedBy: true, manualLogin: true };
@@ -448,6 +448,10 @@ export class Hub {
     this.MAIL_PROVIDERS = (env.GHOSTCLOUD_MAIL_PROVIDERS || "https://api.duckmail.sbs,https://api.mail.gw")
       .split(",").map((s) => s.trim()).filter(Boolean);
     this.MAIL_DOMAIN = (env.GHOSTCLOUD_MAIL_DOMAIN || "").trim().toLowerCase();
+    // emailnator hands out real @gmail.com aliases, which Raccoon's disposable
+    // -domain screen accepts where every temp-mail domain is refused; see the
+    // lane for the measurements. Kept switchable in case the service goes.
+    this.EMAILNATOR_ENABLED = env.GHOSTCLOUD_EMAILNATOR !== "off";
     this.TEMPMAILLOL_ENABLED = env.GHOSTCLOUD_TEMPMAILLOL !== "off";
     this.PRO_CODE = env.GHOSTCLOUD_PRO_CODE || "";
     this.PRO_EPOCH = env.GHOSTCLOUD_PRO_EPOCH || "1";
@@ -1129,6 +1133,75 @@ export class Hub {
       },
     };
   }
+  // emailnator.com — a real @gmail.com alias, free and keyless.
+  //
+  // Its generated addresses are Gmail plus-addresses on accounts the service
+  // maintains, so the *domain* is gmail.com: the one domain Raccoon's
+  // disposable-domain screen accepts. Measured live 2026-11-06 against
+  // /users/emailRegister, fresh from a keyless POST /api/generate-email:
+  //
+  //   ac134899+d539h@gmail.com          → "Human verification is required" (accepted)
+  //   m.y.llasanjose@gmail.com          → accepted
+  //   com.iam.ae.600@googlemail.com     → accepted
+  //
+  // …where every disposable domain of every other provider answers "Temporary
+  // email addresses are not supported." That is what makes this the first lane
+  // since the blocklist sweep that can actually receive a registration code.
+  //
+  // Two properties of the service shape the code below:
+  //   * a freshly generated address starts with an empty inbox, and the list
+  //     endpoint is per-address, so a code can't be read as another
+  //     registration's — but the service keeps inboxes for *everyone*, so `read`
+  //     still ignores anything older than the mailbox itself (`since`).
+  //   * inboxes are public to anyone who knows the address. That is acceptable
+  //     for a code that lives about two minutes and is worthless once the
+  //     account exists with our password, and it is exactly why this lane is
+  //     only used to create an account, never to hold anything worth keeping.
+  get emailnatorLane() {
+    const HDRS = {
+      "content-type": "application/json",
+      origin: "https://www.emailnator.com",
+      referer: "https://www.emailnator.com/",
+      "user-agent": BROWSER_UA,
+    };
+    const generate = async (kind) => {
+      const d = await parseJsonResponse(await fetchWithTimeout("https://www.emailnator.com/api/generate-email", {
+        method: "POST", headers: HDRS, body: JSON.stringify({ ids: [kind] }),
+      }, 20000), "Account service");
+      if (d.status !== "success" || !d.email) throw new Error(d.error || "emailnator returned no mailbox");
+      return d.email;
+    };
+    return {
+      id: "emailnator.com",
+      create: async () => {
+        // ids from the site's own client: 2 = plus-gmail, 3 = dot-gmail,
+        // 8 = googlemail. Tried in order, so one retired id can't kill the lane.
+        let email = null, lastErr = null;
+        for (const kind of [2, 3, 8]) {
+          try { email = await generate(kind); break; } catch (e) { lastErr = e; }
+        }
+        if (!email) throw lastErr || new Error("emailnator returned no mailbox");
+        return { email, handle: { lane: "emailnator", email, since: Math.floor(Date.now() / 1000) - 120 } };
+      },
+      read: async (handle) => {
+        const list = await parseJsonResponse(await fetchWithTimeout("https://www.emailnator.com/api/message-list", {
+          method: "POST", headers: HDRS, body: JSON.stringify({ email: handle.email, limit: 20 }),
+        }, 20000), "Mail service");
+        const msgs = (list.messages || [])
+          .filter((m) => Number(m.timestamp || 0) >= (handle.since || 0))
+          .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0));
+        // Newest first, and only the newest few: an older message in a recycled
+        // inbox must never be quoted back as this registration's code.
+        for (const m of msgs.slice(0, 3)) {
+          const full = await parseJsonResponse(await fetchWithTimeout(
+            `https://www.emailnator.com/api/message/${encodeURIComponent(m.id)}`, { headers: HDRS }, 20000), "Mail service");
+          const code = codeFromText([full.content, full.text, full.subject].filter(Boolean).join("\n"));
+          if (code) return code;
+        }
+        return null;
+      },
+    };
+  }
   mailtmLane(base) {
     const self = this;
     return {
@@ -1169,6 +1242,7 @@ export class Hub {
     const lanes = [];
     const d = this.domainLane;
     if (d) lanes.push(d);
+    if (this.EMAILNATOR_ENABLED) lanes.push(this.emailnatorLane);
     if (this.TEMPMAILLOL_ENABLED) lanes.push(this.tempmailLolLane);
     this.MAIL_PROVIDERS.forEach((b) => lanes.push(this.mailtmLane(b)));
     return lanes;
@@ -2177,7 +2251,8 @@ export class Hub {
   async handleGetCode(ctx) {
     const body = ctx.body || {};
     let lane = null;
-    if (body.lane === "tempmail.lol" && body.mailToken) lane = this.tempmailLolLane;
+    if (body.lane === "emailnator" && body.email) lane = this.emailnatorLane;
+    else if (body.lane === "tempmail.lol" && body.mailToken) lane = this.tempmailLolLane;
     else if (body.lane === "domain" && body.email && this.domainLane) lane = this.domainLane;
     else if (body.lane === "mailtm" || (!body.lane && body.mailJwt)) {
       const base = typeof body.base === "string" && this.MAIL_PROVIDERS.includes(body.base) ? body.base : this.MAIL_PROVIDERS[0];
