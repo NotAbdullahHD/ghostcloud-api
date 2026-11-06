@@ -626,6 +626,28 @@ Both lanes are live probes, not mocks: `node .freebuff/probe_emailnator_live.mjs
 and `node .freebuff/probe_grabmail_live.mjs` call `createMailbox` against the real
 providers and the real `emailRegister` screen.
 
+## "This site has used its human checks for now" (3.2.5)
+
+The three-checks-an-hour ceiling is **ours**, not Raccoon's. It was added so a
+burst of solves could not provoke their per-egress-IP lockout, which costs every
+player the only way back for an hour — but during setup it just blocks the person
+trying to find out whether games work at all, and it reads like an outage.
+
+`GHOSTCLOUD_CHECK_BUDGET` now overrides it: a number (e.g. `"20"`), or `"off"` for
+no local ceiling. The shipped value is `"off"` so testing is unimpeded; set it back
+to `3` once the pool is seeded, because that number is what keeps the pool
+building steadily instead of in a burst that trips Raccoon.
+
+"off" is not a bypass: Raccoon's own limit still answers, and it is reported as
+`limited_by: "service"` (`"site"` means our allowance, and only that one is worth
+waiting out). `/healthz` reports `check_budget` and, when finite,
+`checks_left_this_hour`.
+
+Guarded by `.freebuff/test_check_budget.js` (17 assertions): the default is still
+3, `"off"` survives forty takes and reports itself as `"off"`, a numeric budget is
+enforced exactly, a service lockout still closes the check and is attributed to
+the service, and nonsense values fall back to 3.
+
 ## "Try again in X seconds" — the check's own rate limit
 
 Raccoon rate-limits puzzle attempts per window (`429 Too many puzzle attempts`,

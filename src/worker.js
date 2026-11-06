@@ -109,7 +109,7 @@ const MAIL_DOMAIN_SCREEN_TTL_MS = 6 * 60 * 60 * 1000;
 // closed: an account made at Raccoon's own site now works here as-is — no
 // mailbox, no provider, no puzzle, no shared budget — and `share` seeds it into
 // the pool, so one hand-made account turns free play back on for everyone.
-const API_VERSION = "3.2.4";
+const API_VERSION = "3.2.5";
 // Capabilities the site probes for. Anything missing means the running Worker is
 // an older build than the site expects.
 const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: true, autoCapacity: true, optInUnlock: true, unlockCountdown: true, manualRegister: true, seedPool: true, verificationEvents: true, codeRefusals: true, mailDomainScreen: true, poolValidation: true, readinessHealth: true, queueAll: true, offerOnlyWhenEmpty: true, queueEta: true, checkLimitedBy: true, manualLogin: true };
@@ -129,6 +129,19 @@ const API_CAPABILITIES = { puzzle: true, puzzleResilience: true, puzzleBudget: t
 // reused forever, so the pool is built over hours, not in one sitting.
 const PUZZLE_ISSUE_MAX = 3;
 const PUZZLE_ISSUE_WINDOW_MS = 60 * 60 * 1000;
+// The allowance above is OURS, not Raccoon's: it exists so a burst of solves
+// cannot provoke their per-egress-IP lockout, which costs every player the only
+// way back for an hour. During setup and testing that guard is just in the way,
+// so `GHOSTCLOUD_CHECK_BUDGET` overrides it: a number, or "off" (no local limit).
+// "off" does not unlock Raccoon — their own limit still answers, and that one is
+// reported as `limited_by: "service"` so it is never mistaken for ours.
+function parseCheckBudget(raw) {
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (!v) return PUZZLE_ISSUE_MAX;
+  if (v === "off" || v === "unlimited") return Infinity;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n >= 0 ? (n === 0 ? Infinity : n) : PUZZLE_ISSUE_MAX;
+}
 // A Raccoon lockout is reported in seconds and can be an hour. Cap what we
 // believe so a nonsense number cannot park the check forever.
 const PUZZLE_BLOCK_MAX_MS = 60 * 60 * 1000;
@@ -456,6 +469,10 @@ export class Hub {
     // one service's outage or rate limit cannot take mail down on its own.
     this.GRABMAIL_ENABLED = env.GHOSTCLOUD_GRABMAIL !== "off";
     this.TEMPMAILLOL_ENABLED = env.GHOSTCLOUD_TEMPMAILLOL !== "off";
+    // How many human checks this site hands out per hour. Defaults to the
+    // conservative 3; "off" removes our ceiling entirely (Raccoon's still
+    // applies). See parseCheckBudget.
+    this.CHECK_BUDGET = parseCheckBudget(env.GHOSTCLOUD_CHECK_BUDGET);
     this.PRO_CODE = env.GHOSTCLOUD_PRO_CODE || "";
     this.PRO_EPOCH = env.GHOSTCLOUD_PRO_EPOCH || "1";
     this.PRO_DAILY_SECONDS = 8 * 3600;
@@ -741,9 +758,12 @@ export class Hub {
     // Raccoon's hour-long lockout or our own allowance — they read identically on
     // screen, and only one of them is worth waiting out.
     const usedRecently = this.puzzleIssueTimes.filter((t) => t > Date.now() - PUZZLE_ISSUE_WINDOW_MS).length;
-    body.checks_left_this_hour = Math.max(0, PUZZLE_ISSUE_MAX - usedRecently);
+    // null, not a number, when the allowance is off: `Math.max(0, Infinity - n)`
+    // is not a thing anyone should have to read in a health check.
+    body.checks_left_this_hour = Number.isFinite(this.CHECK_BUDGET) ? Math.max(0, this.CHECK_BUDGET - usedRecently) : null;
+    body.check_budget = Number.isFinite(this.CHECK_BUDGET) ? this.CHECK_BUDGET : "off";
     if (puzzleLeft > 0) body.check_limited_by = "service";
-    else if (usedRecently >= PUZZLE_ISSUE_MAX) body.check_limited_by = "site";
+    else if (usedRecently >= this.CHECK_BUDGET) body.check_limited_by = "site";
     return { status: reason ? 503 : 200, body };
   }
   // Is this pooled account still able to log in? One authenticated checkCost,
@@ -2408,7 +2428,7 @@ export class Hub {
   puzzleAvailable() {
     if (this.puzzleBlockRemaining() > 0) return false;
     const now = Date.now();
-    return this.puzzleIssueTimes.filter((t) => t > now - PUZZLE_ISSUE_WINDOW_MS).length < PUZZLE_ISSUE_MAX;
+    return this.puzzleIssueTimes.filter((t) => t > now - PUZZLE_ISSUE_WINDOW_MS).length < this.CHECK_BUDGET;
   }
   // Seconds until a player's drag could pass again: Raccoon's own lockout or
   // this Worker's window, whichever is longer. Zero when the check is open.
@@ -2416,7 +2436,7 @@ export class Hub {
     const block = this.puzzleBlockRemaining();
     const now = Date.now();
     const used = this.puzzleIssueTimes.filter((t) => t > now - PUZZLE_ISSUE_WINDOW_MS).length;
-    if (used < PUZZLE_ISSUE_MAX) return block;
+    if (used < this.CHECK_BUDGET) return block;
     return Math.max(block, this.puzzleBudgetWait());
   }
   notePuzzleBlocked(seconds, why) {
@@ -2431,8 +2451,11 @@ export class Hub {
   takePuzzleBudget() {
     const now = Date.now();
     this.puzzleIssueTimes = this.puzzleIssueTimes.filter((t) => t > now - PUZZLE_ISSUE_WINDOW_MS);
-    if (this.puzzleIssueTimes.length >= PUZZLE_ISSUE_MAX) return false;
+    if (this.puzzleIssueTimes.length >= this.CHECK_BUDGET) return false;
     this.puzzleIssueTimes.push(now);
+    // With the budget off this array would otherwise grow all hour and be written
+    // to storage on every ask; the count only matters inside one window.
+    if (this.puzzleIssueTimes.length > 200) this.puzzleIssueTimes = this.puzzleIssueTimes.slice(-200);
     this.state.waitUntil(this.storage.put("puzzleIssueTimes", this.puzzleIssueTimes).catch(() => {}));
     return true;
   }
